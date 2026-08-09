@@ -1,0 +1,138 @@
+import Foundation
+import ScreenCaptureKit
+import AVFoundation
+
+enum RecorderError: Error {
+    case permissionDenied
+    case noDisplayAvailable
+    case alreadyRecording
+    case notRecording
+}
+
+/// Captures system audio and microphone audio through a single
+/// ScreenCaptureKit stream (SCStreamConfiguration.captureMicrophone +
+/// .capturesAudio together), rather than pairing ScreenCaptureKit with a
+/// separate AVAudioEngine mic tap. Both signals arrive through the same
+/// synchronized capture pipeline, which sidesteps the cross-stream clock
+/// drift that two independently-clocked APIs would introduce over a long
+/// recording (see TODOS.md / eng review outside-voice finding).
+///
+/// Writes incrementally to an AVAudioFile so a crash or force-quit leaves a
+/// valid, playable partial file rather than a corrupt one — RecordingRecovery
+/// picks up any file left in-progress on the next launch.
+final class AudioRecorder: NSObject {
+    private var stream: SCStream?
+    private var audioFile: AVAudioFile?
+    private var currentSession: RecordingSession?
+    private let recoveryMarker = RecordingRecovery()
+
+    private(set) var isRecording = false
+
+    func startRecording() async throws -> RecordingSession {
+        guard !isRecording else { throw RecorderError.alreadyRecording }
+
+        guard await PermissionManager.checkSystemAudioPermission() == .granted else {
+            throw RecorderError.permissionDenied
+        }
+
+        let content = try await SCShareableContent.current
+        guard let display = content.displays.first else {
+            throw RecorderError.noDisplayAvailable
+        }
+
+        // Audio-only capture: exclude on-screen content, we only want the
+        // audio tracks. An empty content filter still requires a display
+        // reference internally, hence resolving `display` above even though
+        // no video is captured.
+        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+
+        let config = SCStreamConfiguration()
+        config.capturesAudio = true
+        config.captureMicrophone = true
+        config.excludesCurrentProcessAudio = true
+        config.sampleRate = 48_000
+        config.channelCount = 2
+
+        let session = try RecordingSession.startNew()
+        try recoveryMarker.markInProgress(session)
+
+        let outputFormat = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        audioFile = try AVAudioFile(forWriting: session.audioFileURL, settings: outputFormat.settings)
+
+        let newStream = SCStream(filter: filter, configuration: config, delegate: self)
+        try newStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "audio.capture.queue"))
+        try newStream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: DispatchQueue(label: "mic.capture.queue"))
+        try await newStream.startCapture()
+
+        self.stream = newStream
+        self.currentSession = session
+        self.isRecording = true
+        return session
+    }
+
+    func stopRecording() async throws -> RecordingSession {
+        guard isRecording, let session = currentSession, let activeStream = stream else {
+            throw RecorderError.notRecording
+        }
+
+        try await activeStream.stopCapture()
+        audioFile = nil
+        stream = nil
+        isRecording = false
+        currentSession = nil
+
+        var finished = session
+        finished.endedAt = Date()
+        try recoveryMarker.markFinished(finished)
+        return finished
+    }
+
+    private func write(_ sampleBuffer: CMSampleBuffer) {
+        guard let audioFile, let pcmBuffer = sampleBuffer.asPCMBuffer(format: audioFile.processingFormat) else {
+            return
+        }
+        try? audioFile.write(from: pcmBuffer)
+    }
+}
+
+extension AudioRecorder: SCStreamOutput {
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .audio || type == .microphone else { return }
+        guard sampleBuffer.isValid else { return }
+        write(sampleBuffer)
+    }
+}
+
+extension AudioRecorder: SCStreamDelegate {
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        // The stream stopped unexpectedly (not via our own stopRecording()).
+        // Leave the in-progress marker in place — RecordingRecovery will
+        // pick this up as an orphaned recording on next launch rather than
+        // silently losing the failure.
+        isRecording = false
+    }
+}
+
+private extension CMSampleBuffer {
+    func asPCMBuffer(format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(self) else { return nil }
+        let frameCount = AVAudioFrameCount(numSamples)
+        guard let pcmBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
+        pcmBuffer.frameLength = frameCount
+
+        var lengthAtOffset = 0
+        var totalLength = 0
+        var dataPointer: UnsafeMutablePointer<Int8>?
+        guard CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: &lengthAtOffset, totalLengthOut: &totalLength, dataPointerOut: &dataPointer) == kCMBlockBufferNoErr,
+              let dataPointer else {
+            return nil
+        }
+
+        if let channelData = pcmBuffer.floatChannelData {
+            dataPointer.withMemoryRebound(to: Float.self, capacity: totalLength / MemoryLayout<Float>.size) { floatPointer in
+                channelData[0].update(from: floatPointer, count: Int(frameCount))
+            }
+        }
+        return pcmBuffer
+    }
+}

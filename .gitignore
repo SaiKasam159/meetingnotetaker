@@ -1,0 +1,15 @@
+.build/
+.swiftpm/
+Vendor/whisper.cpp/build/
+Vendor/whisper.cpp/models/*.bin
+*.xcodeproj
+DerivedData/
+.DS_Store
+kickbacks-v2.vsix
+
+# Claude Code skill tooling — independent git repos / local installs,
+# not part of the meetingnotetaker application itself.
+VibeSec-Skill/
+humanizer/
+.claude/skills/
+.claude/scheduled_tasks.lock
