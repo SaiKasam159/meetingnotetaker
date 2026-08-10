@@ -207,11 +207,23 @@ end-to-end `WhisperTranscriberTests` case.
 
 ### Remaining Work (Phase 2 — none of this has started)
 
+0. **BLOCKED on Ollama installation.** `brew install ollama` fails two independent
+   ways on this machine: Homebrew's prefix at `/usr/local/Homebrew` isn't owned by the
+   user account (`sudo chown -R SaiKasam /usr/local/Homebrew` would fix that one, but
+   that's a sudo step for the human, same policy as the Xcode CLT setup earlier), and
+   separately Homebrew's core crashes on macOS 26.4.1 (`macos_version.rb:42` doesn't
+   recognize the version string) — a second, unrelated bug that fixing ownership alone
+   won't resolve. **Recommended path: skip Homebrew entirely, download Ollama.app
+   directly from ollama.com/download** (drag-to-Applications, no sudo, includes the
+   `ollama` CLI). Once installed and running (`ollama serve`, or just launch the app),
+   Phase 2 work can proceed. Check with `curl http://localhost:11434/api/version`.
 1. **Diarization decision is gated** — resolve it (real approach, or explicit
    unattributed fallback) before writing any Ollama action-item extraction code.
-2. Install and wire Ollama; prototype summarization/action-item extraction prompts
-   against real transcripts. Benchmark model choice (design doc suggested Llama 3.1 8B
-   or Qwen2.5 as starting candidates, never benchmarked).
+2. Wire Ollama; prototype summarization/action-item extraction prompts against real
+   transcripts. Benchmark model choice (design doc suggested Llama 3.1 8B or Qwen2.5 as
+   starting candidates, never benchmarked). Summarization does NOT need the diarization
+   decision — only action-item extraction (owner attribution) does — so summarization
+   work can start as soon as Ollama itself is installed.
 3. Build the MCP server — Unix domain socket auth (locked direction, see above), tool
    surface: `search_meetings`, `get_transcript`, `get_summary`, `get_action_items`
    (names proposed in the original design doc, not yet reconfirmed).
