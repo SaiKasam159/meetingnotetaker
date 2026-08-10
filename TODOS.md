@@ -14,17 +14,19 @@ Captured during `/plan-eng-review` on 2026-08-09, deferred from Phase 1 (audio c
 **Why:** Action items need an owner to be useful once written to Google Calendar/Gmail, but attribution isn't designed yet.
 **Pros:** Makes extracted action items actually actionable rather than anonymous text.
 **Cons:** Real complexity (diarization models, per-speaker audio separation). Not needed for Phase 1, which only captures and transcribes.
-**Context:** Surfaced during the adversarial design-doc review and confirmed during eng review. Decide before Phase 2's Ollama-based action-item extraction work starts, since the extraction prompts and Calendar/email write-back logic depend on whether attribution exists.
-**Depends on / blocked by:** Phase 1 shipping first.
+**Context:** Surfaced during the adversarial design-doc review and confirmed during eng review. During the Phase 1 hardening pass (2026-08-10), whisper.cpp's experimental "tinydiarize" model variant (`-tdrz`, already part of the vendored submodule, no new dependency) was evaluated as a pragmatic v1 option and explicitly rejected: it only detects speaker-turn changes ("someone new started talking"), not verified speaker identity, so labels can drift/misattribute once a 3rd+ speaker re-enters a conversation. Research into a proper speaker-identity approach (e.g. a local pyannote-based sidecar process) continues separately.
+**Hard gate:** Must be decided — proper diarization, or an explicit "ship Phase 2 with unattributed action items" fallback — before the first line of Ollama action-item extraction code is written. Milestone-gated rather than date-gated, chosen deliberately after an outside-voice review flagged that "keep researching" with no concrete trigger risks leaving this permanently unresolved.
+**Depends on / blocked by:** Phase 1 shipping first (done). Blocks the start of Phase 2's Ollama extraction implementation.
 
 ## Data retention / deletion policy
 
 **What:** Decide whether raw audio and transcripts are kept forever or auto-pruned, and build the policy.
 **Why:** Local disk grows unbounded otherwise — audio files are large, and no compression or diarization-based trimming is decided yet.
-**Pros:** Prevents silent disk bloat; gives the user control over how much history is kept.
-**Cons:** Adds a settings surface and a background cleanup job that aren't needed to prove the core pipeline works.
-**Context:** Flagged in the adversarial design-doc review as a missing requirement. Easier to bake a retention field into the storage schema now (Phase 1) than retrofit it after data has already accumulated without one.
-**Depends on / blocked by:** Phase 1 storage schema design.
+**Decision (locked 2026-08-10, during Phase 1 hardening pass):** Auto-delete raw audio 7 days after recording (grace period to allow re-running transcription against the source audio if a transcript comes out bad). Transcripts are kept indefinitely. `Meeting.retainUntil` is set at insert time (which now happens right after recording stops, not after transcription — see "untranscribed audio" note below); `Meeting.audioDeletedAt` marks when audio was actually removed, with `audioFilePath` kept as a historical record rather than nulled out. `MeetingStore.deleteExpiredAudio()` runs once at app startup, before the interactive recording prompt. Building this surfaced (and fixed) a real gap: a `Meeting` row is now inserted immediately after recording stops, before transcription is attempted — previously, audio that failed to transcribe (e.g. missing model) got no DB row and was permanently exempt from retention, which was the exact audio most likely to accumulate unreviewed.
+**Pros:** Prevents silent disk bloat; a real deletion policy now covers 100% of recorded audio, not just the successfully-transcribed subset.
+**Cons:** No settings surface to change the 7-day window yet (hardcoded) — deferred until there's a UI (Phase 2) to expose it. No way to browse/list meetings before deletion happens yet either — flagged by an outside-voice review as a real gap; accepted as a known limitation for this pass rather than blocking on building a browse command first.
+**Context:** Flagged in the adversarial design-doc review as a missing requirement. Implemented during the Phase 1 hardening pass; see HANDOFF.md history in git log around 2026-08-10 for the full design discussion including the outside-voice findings that shaped the final implementation (DB migration approach, startup sequencing, the untranscribed-audio blind spot fix).
+**Depends on / blocked by:** None — implemented as part of the Phase 1 hardening pass.
 
 ## Remote-participant consent notification
 
@@ -48,16 +50,18 @@ Captured during `/plan-eng-review` on 2026-08-09, deferred from Phase 1 (audio c
 
 **What:** Decide and implement an auth model for the Phase 2 MCP server before it ships — e.g. a local auth token, or a Unix socket scoped by file permissions rather than an open TCP port.
 **Why:** An unauthenticated localhost server exposing "search all meeting transcripts" is a new local attack surface — any other local process could query it. This undercuts the "nothing leaves the device except the bounded Calendar/Gmail exception" pitch, since the exception list never accounted for other local processes reaching in.
-**Pros:** Closes a real gap in the local-only threat model before it exists, not after.
+**Decision (locked 2026-08-10, during Phase 1 hardening pass):** Unix domain socket, scoped by file permissions to the user's own account — not a TCP port with a bearer token. No token generation, storage, or rotation to manage; the OS already enforces "only processes running as you can connect."
+**Pros:** Closes a real gap in the local-only threat model before it exists, not after. Zero token-lifecycle complexity.
 **Cons:** Adds design work to Phase 2's MCP server scope. Doesn't block Phase 1.
-**Context:** Surfaced by the outside-voice cross-model review during eng review. Not caught by the original architecture review since MCP wasn't in scope for Phase 1.
-**Depends on / blocked by:** Phase 2 MCP server design.
+**Context:** Surfaced by the outside-voice cross-model review during eng review. Not caught by the original architecture review since MCP wasn't in scope for Phase 1. Direction locked during the Phase 1 hardening pass even though implementation waits for Phase 2, so this doesn't get re-litigated later.
+**Depends on / blocked by:** Phase 2 MCP server implementation (direction is decided; only the build is pending).
 
 ## Encryption at rest
 
 **What:** Decide whether the local transcript/audio store should be encrypted on disk, and implement it if so.
 **Why:** Raises the privacy bar if the laptop is lost, stolen, or shared — meeting content is sensitive, and the whole project's premise is privacy.
-**Pros:** Stronger privacy guarantee, consistent with the "must run and store locally" positioning against Granola.
-**Cons:** Adds real complexity (key management, macOS Keychain integration for the encryption key itself). Not needed to prove the core pipeline works.
-**Context:** Raised during eng review. Worth deciding deliberately rather than defaulting to plaintext storage by accident. macOS FileVault (full-disk encryption) provides a baseline if enabled, which may be sufficient depending on the threat model chosen.
-**Depends on / blocked by:** Phase 1 storage schema design.
+**Decision (locked 2026-08-10, during Phase 1 hardening pass):** FileVault-only — no app-layer encryption (no SQLCipher, no custom AES/Keychain key management). v1's realistic threat model is a lost/stolen *powered-off* laptop, which FileVault (AES-XTS, Secure Enclave-backed on Apple Silicon/T2 Macs) already covers; app-layer encryption would mainly add protection against another logged-in user on the same machine or malware while logged in, neither of which is in scope for solo, single-Mac use. The app checks FileVault status at every launch (`StorageLocation.isFileVaultEnabled()`) and warns (does not block launch) if it's off, matching the existing accepted-risk pattern used for the iCloud-exclusion mitigation.
+**Pros:** Real security boundary with zero new infrastructure (key management, migration of existing plaintext data) — matches the actual threat model instead of over-building for one not in scope.
+**Cons:** Does not protect against another logged-in user on the same machine, or malware running while logged in. Revisit if the threat model changes (shared-machine use, multi-user).
+**Context:** Raised during eng review; resolved during the Phase 1 hardening pass after checking that FileVault (AES-XTS, hardware-backed) already covers the realistic threat model for solo use.
+**Depends on / blocked by:** None — implemented as part of the Phase 1 hardening pass.

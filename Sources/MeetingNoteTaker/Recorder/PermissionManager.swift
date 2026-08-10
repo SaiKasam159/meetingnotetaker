@@ -28,7 +28,13 @@ struct PermissionManager {
     }
 
     static func checkMicrophonePermission() -> RecordingPermissionStatus {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        mapAuthorizationStatus(AVCaptureDevice.authorizationStatus(for: .audio))
+    }
+
+    /// Pure mapping, split out from checkMicrophonePermission() so the
+    /// branching is directly unit-testable without a real TCC prompt.
+    static func mapAuthorizationStatus(_ status: AVAuthorizationStatus) -> RecordingPermissionStatus {
+        switch status {
         case .authorized:
             return .granted
         case .denied, .restricted:

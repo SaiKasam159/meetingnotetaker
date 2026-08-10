@@ -69,4 +69,35 @@ enum StorageLocation {
             FileManager.default.createFile(atPath: ignoreMarker.path, contents: nil)
         }
     }
+
+    /// FileVault (not app-layer encryption) is the accepted v1 data-at-rest
+    /// boundary — see TODOS.md "Encryption at rest". Checked at every launch;
+    /// callers should warn and continue, never block, matching the same
+    /// accepted-risk posture as the iCloud-exclusion mitigation above.
+    static func isFileVaultEnabled() -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/fdesetup")
+        process.arguments = ["status"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return parseFileVaultStatus(output)
+    }
+
+    /// Pure parser, split out from isFileVaultEnabled() so the parsing logic
+    /// is testable without shelling out. Fail-closed: any output that isn't
+    /// unambiguously "On" is treated as disabled, so an unrecognized format
+    /// (a future macOS `fdesetup` change) triggers the warning rather than
+    /// silently assuming protection.
+    static func parseFileVaultStatus(_ output: String) -> Bool {
+        output.contains("FileVault is On.")
+    }
 }

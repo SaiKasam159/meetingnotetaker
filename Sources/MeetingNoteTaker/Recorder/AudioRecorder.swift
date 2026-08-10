@@ -7,7 +7,18 @@ enum RecorderError: Error {
     case noDisplayAvailable
     case alreadyRecording
     case notRecording
+    case captureFailed(underlying: Error)
 }
+
+/// Narrow seam around AVAudioFile.write(from:) so AudioRecorder's
+/// write-error handling can be exercised with a throwing test double instead
+/// of requiring a real disk-full condition. AVAudioFile already conforms to
+/// this structurally, so production code needs no wrapping.
+protocol AudioFileWriting {
+    func write(from buffer: AVAudioPCMBuffer) throws
+}
+
+extension AVAudioFile: AudioFileWriting {}
 
 /// Captures system audio and microphone audio through a single
 /// ScreenCaptureKit stream (SCStreamConfiguration.captureMicrophone +
@@ -22,11 +33,19 @@ enum RecorderError: Error {
 /// picks up any file left in-progress on the next launch.
 final class AudioRecorder: NSObject {
     private var stream: SCStream?
-    private var audioFile: AVAudioFile?
+    // Not `private` (default `internal`): tests inject a throwing double via
+    // @testable import to exercise the write-error path in writePCMBuffer(_:)
+    // without needing a real disk-full condition or live capture.
+    var audioFile: AudioFileWriting?
+    private var captureFormat: AVAudioFormat?
     private var currentSession: RecordingSession?
     private let recoveryMarker = RecordingRecovery()
 
     private(set) var isRecording = false
+    /// Set when a write fails (disk full, etc.) or the stream stops
+    /// unexpectedly (didStopWithError). stopRecording() surfaces this as
+    /// RecorderError.captureFailed instead of losing it silently.
+    private(set) var lastError: Error?
 
     func startRecording() async throws -> RecordingSession {
         guard !isRecording else { throw RecorderError.alreadyRecording }
@@ -57,6 +76,7 @@ final class AudioRecorder: NSObject {
         try recoveryMarker.markInProgress(session)
 
         let outputFormat = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        captureFormat = outputFormat
         audioFile = try AVAudioFile(forWriting: session.audioFileURL, settings: outputFormat.settings)
 
         let newStream = SCStream(filter: filter, configuration: config, delegate: self)
@@ -72,6 +92,12 @@ final class AudioRecorder: NSObject {
 
     func stopRecording() async throws -> RecordingSession {
         guard isRecording, let session = currentSession, let activeStream = stream else {
+            // Not recording — most likely the stream already died via
+            // didStopWithError. Surface whatever it recorded instead of a
+            // generic .notRecording that hides the real cause.
+            let error = lastError
+            lastError = nil
+            try Self.finalizeCaptureError(error)
             throw RecorderError.notRecording
         }
 
@@ -84,14 +110,40 @@ final class AudioRecorder: NSObject {
         var finished = session
         finished.endedAt = Date()
         try recoveryMarker.markFinished(finished)
+
+        let error = lastError
+        lastError = nil
+        try Self.finalizeCaptureError(error)
+
         return finished
     }
 
+    /// Pure throw-decision, split out so it's unit-testable without a live
+    /// SCStream or AudioRecorder instance at all — just call it with an
+    /// Error? and check whether/what it throws.
+    static func finalizeCaptureError(_ error: Error?) throws {
+        if let error {
+            throw RecorderError.captureFailed(underlying: error)
+        }
+    }
+
     private func write(_ sampleBuffer: CMSampleBuffer) {
-        guard let audioFile, let pcmBuffer = sampleBuffer.asPCMBuffer(format: audioFile.processingFormat) else {
+        guard let captureFormat, let pcmBuffer = sampleBuffer.asPCMBuffer(format: captureFormat) else {
             return
         }
-        try? audioFile.write(from: pcmBuffer)
+        writePCMBuffer(pcmBuffer)
+    }
+
+    /// Not `private`: exercised directly by tests with a throwing
+    /// AudioFileWriting double, bypassing the need for a real CMSampleBuffer
+    /// or live capture.
+    func writePCMBuffer(_ buffer: AVAudioPCMBuffer) {
+        guard let audioFile else { return }
+        do {
+            try audioFile.write(from: buffer)
+        } catch {
+            lastError = error
+        }
     }
 }
 
@@ -108,7 +160,14 @@ extension AudioRecorder: SCStreamDelegate {
         // The stream stopped unexpectedly (not via our own stopRecording()).
         // Leave the in-progress marker in place — RecordingRecovery will
         // pick this up as an orphaned recording on next launch rather than
-        // silently losing the failure.
+        // silently losing the failure. Store the error and clear state so a
+        // subsequent stopRecording() call surfaces the real cause instead of
+        // a misleading .notRecording, and so stream/audioFile/currentSession
+        // don't linger as stale references.
+        lastError = error
+        self.stream = nil
+        audioFile = nil
+        currentSession = nil
         isRecording = false
     }
 }

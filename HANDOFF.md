@@ -1,59 +1,51 @@
 ---
 status: in-progress
 branch: main
-timestamp: 2026-08-10T08:23:51Z
+timestamp: 2026-08-10T19:58:00Z
 files_modified: []
 ---
 
-## Working on: Harden Phase 1, scope-lock Phase 2 (meetingnotetaker)
+## Working on: meetingnotetaker — Phase 1 hardened, Phase 2 (Ollama/MCP/Calendar/Gmail) next
 
 ### Summary
 
 meetingnotetaker is a local-first macOS replica of Granola: record meetings (mic +
 system audio), transcribe locally via whisper.cpp, store everything on-disk, no cloud
 except a narrow bounded exception for user-initiated Google Calendar/Gmail writes.
-Phase 1 (capture + transcription + storage) is fully built, committed, and verified
-end-to-end against a **real recording** (not just the test sample) — permissions,
-transcription accuracy, and SQLite persistence all confirmed working by the user
-directly. This session ran `/plan-eng-review` to harden Phase 1 before starting Phase 2
-(Ollama summarization, MCP server, Calendar/Gmail write-back), with UI work (replacing
-the current `readLine()`-based CLI) explicitly deferred into Phase 2 per the user's
-direction. **The review is mid-flight and unfinished** — several real decisions got
-locked in, then an independent second-opinion review (the "outside voice") found 6
-concrete problems with the plan that were never walked through with the user before the
-session ended. Nothing described in "Decisions Made" below has been implemented in code
-yet — it's all still just decisions.
+**Phase 1 is fully built, hardened, tested, and committed.** It was verified
+end-to-end against a real recording (not just the test sample) before hardening
+started, and the hardening pass below has been implemented and all 22 tests pass.
+Phase 2 (Ollama summarization/action items, MCP server, Calendar/Gmail write-back, and
+the real UI replacing the current `readLine()` CLI) has not started — this doc exists
+so a fresh Claude Code session (this machine or another) can pick that up with full
+context.
 
 ### Repo / environment this assumes
 
-- Repo: `meetingnotetaker`, currently 2 commits on `main`, clean working tree.
-  - `3acaa1b` Wire recorder, transcriber, and storage into the app entry point
-  - `7ae50a3` Scaffold Phase 1: local audio capture, transcription, and storage
+- Repo: `meetingnotetaker`, `main` branch, clean working tree at the time of this save.
 - This machine's `~/.gstack/projects/meetingnotetaker/` holds gstack review artifacts
-  (design doc, test plan, tasks JSONL) that **do not travel with `git clone`/`git pull`**
-  — they're local machine state, not repo content. This handoff doc inlines everything
-  load-bearing from them so the new machine doesn't need that directory at all. If gstack
-  artifact sync is configured on both machines it'll show up anyway, but don't rely on it.
+  (design doc, test plan, tasks JSONL, review log) that **do not travel with
+  `git clone`/`git pull`** — local machine state, not repo content. Everything
+  load-bearing from them is inlined below.
 
-### Toolchain setup required on the new machine (none of this is optional — Phase 1 will not build without all of it)
+### Toolchain setup required on a new machine (none of this is optional — Phase 1 will not build without all of it)
 
-1. **Full Xcode.app, not just Command Line Tools.** CLT-only was missing libc++ headers
-   entirely on this machine. Install Xcode from the App Store, then:
+1. **Full Xcode.app, not just Command Line Tools.** CLT-only was missing libc++
+   headers entirely on the original dev machine. Install Xcode from the App Store:
    ```
    sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
    sudo xcodebuild -license
    ```
-   (Both require an interactive human running them — sudo password + accepting the
-   license text. Claude Code cannot do this step; the user has to.)
-2. **cmake.** Homebrew was broken on this machine; installed via `pip install --user
-   cmake` instead. Use whatever works on the new machine — just needs `cmake` on PATH.
+   Both require an interactive human (sudo password, license text) — Claude Code
+   cannot do this step.
+2. **cmake** on PATH (Homebrew was broken on the original machine; `pip install --user
+   cmake` worked as a substitute — use whatever works on the new machine).
 3. **Clone/pull the repo, then init the submodule:**
    ```
    git submodule update --init --recursive
    ```
    Vendored whisper.cpp lives at `Vendor/whisper.cpp`, pinned to tag `v1.9.2`.
-4. **Build whisper.cpp itself** (this is NOT part of `swift build` — it's a separate
-   CMake project that produces static libs Package.swift links against):
+4. **Build whisper.cpp itself** (a separate CMake project, not part of `swift build`):
    ```
    cd Vendor/whisper.cpp
    cmake -B build -DGGML_METAL=ON -DGGML_BLAS_DEFAULT=ON -DBUILD_SHARED_LIBS=OFF \
@@ -61,8 +53,8 @@ yet — it's all still just decisions.
    cmake --build build --config Release
    cd ../..
    ```
-   Package.swift's linker flags expect libs at exactly these paths (verified against a
-   real build output on 2026-08-09 — ggml-blas and ggml-metal land in their own
+   `Package.swift`'s linker `-L` flags expect libs at exactly these paths (verified
+   against a real build output — ggml-blas and ggml-metal land in their own
    subdirectories, not directly under `ggml/src/`):
    ```
    Vendor/whisper.cpp/build/src              (libwhisper)
@@ -70,271 +62,178 @@ yet — it's all still just decisions.
    Vendor/whisper.cpp/build/ggml/src/ggml-metal
    Vendor/whisper.cpp/build/ggml/src/ggml-blas
    ```
-   If the new machine's `cmake --build` output ever puts these libs somewhere else,
-   Package.swift's `unsafeFlags` `-L` paths need updating to match — don't assume the
-   paths above are guaranteed stable across cmake/whisper.cpp versions.
-5. **Download the Whisper model** (gitignored, not in the repo — `.gitignore` excludes
+   If a new machine's `cmake --build` output puts these libs somewhere else,
+   `Package.swift`'s `unsafeFlags` need updating to match.
+5. **Download the Whisper model** (gitignored — `.gitignore` excludes
    `Vendor/whisper.cpp/models/*.bin`):
    ```
-   cd Vendor/whisper.cpp/models
-   ./download-ggml-model.sh small.en
-   cd ../../..
+   cd Vendor/whisper.cpp/models && ./download-ggml-model.sh small.en && cd ../../..
    ```
-   The user explicitly chose `small.en` as the model size (not base.en or medium.en).
+   `small.en` was explicitly chosen (not base.en or medium.en).
 6. **Verify the CWhisper header symlinks came through.** `Sources/CWhisper/include/`
-   contains symlinks pointing back into the vendored submodule (`whisper.h` and every
-   `ggml/include/*.h` it transitively includes) — e.g.
-   `Sources/CWhisper/include/whisper.h -> ../../../Vendor/whisper.cpp/include/whisper.h`.
-   These were created as real symlinks and committed to git, so `git clone`/`pull`
-   should preserve them, but confirm with `ls -la Sources/CWhisper/include/` — if any
-   show up as regular (broken) files instead of symlinks, re-create them manually.
-   `cSettings.headerSearchPath` was tried first and does NOT work for module-map header
-   resolution in this SPM setup — don't waste time re-trying that approach.
+   contains real symlinks pointing into the vendored submodule (e.g.
+   `whisper.h -> ../../../Vendor/whisper.cpp/include/whisper.h`) — committed to git,
+   should survive clone/pull, but confirm with `ls -la Sources/CWhisper/include/`.
+   `cSettings.headerSearchPath` does NOT work for module-map header resolution in this
+   SPM setup — don't re-try that approach.
 7. **Build and test:**
    ```
    swift build
    swift test
    ```
-   `WhisperTranscriberTests.testTranscribesKnownSampleAudio` is a real end-to-end test
-   against whisper.cpp's own `jfk.wav` sample — it `XCTSkip`s cleanly if the model or
-   sample audio isn't present yet, so a missing model won't fail the build.
-8. **Grant macOS permissions** (GUI-only, cannot be scripted or done by Claude Code):
-   Microphone (prompted automatically on first `swift run`) and **Screen & System Audio
-   Recording** (no code-signing entitlement exists for this — it's TCC-gated purely
-   through System Settings; the app opens the right settings pane automatically but you
-   have to click Allow yourself, then relaunch — macOS requires a relaunch after granting
-   this specific permission, a first `swift run` won't pick it up mid-process).
+   All 22 tests pass as of this save. `WhisperTranscriberTests.testTranscribesKnownSampleAudio`
+   `XCTSkip`s cleanly if the model/sample audio aren't present yet.
+8. **Grant macOS permissions** (GUI-only, cannot be scripted): Microphone (prompted
+   automatically) and **Screen & System Audio Recording** (TCC-gated purely through
+   System Settings — app opens the right pane, but you click Allow, then relaunch;
+   macOS requires a relaunch after granting this specific permission).
 
-### Architecture decisions already locked and built (Phase 1, not up for debate — re-litigating these was explicitly declined during the original eng review)
+### Architecture decisions locked and built (Phase 1 — not up for debate; re-litigating these was explicitly declined during the original eng review)
 
 - **Storage location:** `~/Documents/MeetingNoteTaker`, not `~/Library/Application
-  Support`. This was recommended against twice (original eng review, and again by an
-  outside-voice cross-model review) and the user explicitly overrode both times for
-  Finder discoverability. It's a formally **accepted risk** — logged in `TODOS.md` under
-  "Accepted risk: iCloud-exclusion silent-failure mode." `StorageLocation.swift`
-  self-heals the iCloud-exclusion flag on every launch as the mitigation. Do not
-  re-propose switching this without the user raising it first.
-- **Audio capture:** single unified `SCStreamConfiguration` with `capturesAudio = true`
-  AND `captureMicrophone = true` together (one synchronized ScreenCaptureKit stream),
-  not ScreenCaptureKit + a separate `AVAudioEngine` mic tap — avoids cross-stream clock
-  drift over a long recording.
+  Support`. Recommended against twice and explicitly overridden by the user both times
+  for Finder discoverability — a formally **accepted risk**, logged in `TODOS.md`
+  under "Accepted risk: iCloud-exclusion silent-failure mode." `StorageLocation.swift`
+  self-heals the iCloud-exclusion flag on every launch as mitigation.
+- **Audio capture:** single unified `SCStreamConfiguration` (`capturesAudio = true` +
+  `captureMicrophone = true` together), not ScreenCaptureKit + a separate
+  `AVAudioEngine` mic tap — avoids cross-stream clock drift over a long recording.
 - **Transcription:** vendored whisper.cpp, `small.en` model, **CPU-only inference**
   (`contextParams.use_gpu = false` in `WhisperTranscriber.swift`). Metal GPU produced
-  garbled output ("a" instead of real speech) on this machine's discrete AMD GPU (Radeon
-  Pro 5300M, an older Intel Mac) — confirmed via a real test against whisper.cpp's own
-  known-good `jfk.wav` sample; CPU + Accelerate/BLAS was proven correct by the same test.
-  **This may be an Intel+AMD-GPU-specific bug, not a general whisper.cpp/Metal problem.**
-  If the new machine is Apple Silicon, this is worth re-testing — flip `use_gpu = true`
-  and re-run `WhisperTranscriberTests.testTranscribesKnownSampleAudio` to check. This is
-  tracked as its own TODOS.md item ("Re-test Metal GPU acceleration on Apple Silicon").
+  garbled output on the original dev machine's discrete AMD GPU (Radeon Pro 5300M,
+  Intel Mac) — confirmed via a real test against whisper.cpp's `jfk.wav` sample.
+  **May be Intel+AMD-GPU-specific.** If running on Apple Silicon, worth re-testing:
+  flip `use_gpu = true`, re-run `WhisperTranscriberTests.testTranscribesKnownSampleAudio`.
+  Tracked in `TODOS.md` ("Re-test Metal GPU acceleration on Apple Silicon").
 - **Reasoning/summarization (Phase 2):** fully local via Ollama (design-doc "Approach
-  A"), explicitly chosen over sending transcript text to a hosted API, prioritizing
-  strict local-only privacy over output quality. If local model quality proves unusable
-  for action-item extraction, the accepted fallback is a per-meeting, explicitly
-  opt-in Claude API call — never default-on.
-- **No background daemon / queue system.** The app is a sequential CLI pipeline
-  (record → transcribe → store, one meeting at a time via `readLine()` prompts). This
-  matters for the retention-pruning design below — there's no scheduler to hook into,
-  only "whenever the app happens to launch next."
-- **SQLite via raw C API** (`import SQLite3`, `.linkedLibrary("sqlite3")`), not a
-  wrapper library — `SQLITE_TRANSIENT` destructor constant needed for `sqlite3_bind_text`.
-- Gmail follow-ups are locked as **draft-only, never auto-send** (hard default, not a
-  toggle) — this precedent is why the new Calendar-write decision below mirrors it.
+  A"), chosen over sending transcript text to a hosted API — strict local-only privacy
+  over output quality. Accepted fallback if local model quality proves unusable: a
+  per-meeting, explicitly opt-in Claude API call, never default-on.
+- **No background daemon / queue system.** Sequential CLI pipeline (record →
+  transcribe → store, one meeting at a time via `readLine()` prompts). Retention
+  pruning (below) only runs when the app happens to launch — there's no scheduler.
+- **SQLite via raw C API** (`import SQLite3`), not a wrapper library.
+- Gmail follow-ups: **draft-only, never auto-send** (hard default). Calendar
+  write-back now mirrors this (see below).
 
-### Decisions Made (this session — approved by the user via AskUserQuestion, NOT yet implemented in code)
+### Phase 1 hardening pass — IMPLEMENTED, TESTED, ALL 22 TESTS PASS (2026-08-10)
 
-**Encryption at rest:** FileVault-only, not app-layer encryption (no SQLCipher, no
-custom AES/Keychain key management). Rationale: v1's threat model is a lost/stolen
-*powered-off* laptop, which FileVault (AES-XTS, Secure Enclave-backed) already covers.
-App-layer encryption would only add protection against another logged-in user on the
-same machine or malware while logged in — neither is in scope for solo, single-Mac use.
-`StorageLocation.isFileVaultEnabled()` (not yet written) should check `fdesetup status`
-at every launch; if disabled, **warn and continue — do not block launch**, matching the
-existing accepted-risk pattern already used for the iCloud-exclusion mitigation.
+This ran through a full `/plan-eng-review` including an outside-voice (independent
+Claude subagent — Codex CLI wasn't installed on the dev machine) cross-model review
+that found 6 real problems with the initial plan. All 6 were resolved with the user
+via individual approvals before implementation. What actually shipped:
 
-**Data retention:** auto-delete raw audio 7 days after successful transcription (grace
-period so a bad transcript can still be re-run against the source audio). Transcripts
-are kept indefinitely. `Meeting.retainUntil` (already an unused field in the schema) gets
-set to `transcribedAt + 7 days` at insert time. A new `Meeting.audioDeletedAt: Date?`
-field marks when audio was actually deleted — `audioFilePath` stays as a historical
-record rather than being nulled out, so future code has one explicit field to check
-instead of inferring deletion from a missing file. `MeetingStore.deleteExpiredAudio(now:)`
-(not yet written) was meant to run once at app startup, before the interactive recording
-prompt. **See "Outside-voice findings" below — this whole feature's readiness to be
-built at all is now in question, findings #1, #3, #4, #5 all attack this specifically.**
+**Encryption at rest → FileVault-only.** No app-layer encryption (no SQLCipher, no
+custom AES/Keychain key management) — v1's realistic threat model (lost/stolen
+*powered-off* laptop) is already covered by FileVault. `StorageLocation.isFileVaultEnabled()`
+shells out to `fdesetup status`; `StorageLocation.parseFileVaultStatus(_:)` is the pure,
+tested parser (fail-closed: unrecognized output → treated as disabled). `run()` warns
+and continues if FileVault is off — never blocks launch, matching the iCloud-exclusion
+precedent. TODOS.md "Encryption at rest" entry updated to record this as resolved.
 
-**Speaker diarization:** explicitly held off, NOT built this pass. whisper.cpp has an
-experimental "tinydiarize" model variant (`-tdrz`, already part of the vendored
-submodule, no new dependency) that inserts speaker-turn-change tokens into transcript
-output — but it only detects "someone new started talking," not verified speaker
-*identity*, so labels can drift/misattribute once a 3rd+ speaker re-enters a
-conversation. The user was offered tinydiarize as the recommended pragmatic v1 option
-and explicitly declined it, choosing instead to hold off and research a proper
-speaker-identity approach (e.g. a local pyannote-based sidecar process) before building
-anything. **See outside-voice finding #6 — this deferral doesn't actually satisfy
-Phase 2's own stated entry condition ("decide before Phase 2 extraction starts").**
+**Data retention → 7-day auto-delete of raw audio, transcripts kept forever.**
+`Meeting.audioDeletedAt: Date?` is the new schema field (kept `audioFilePath` as a
+historical record rather than nulling it out). `MeetingStore.deleteExpiredAudio(now:)`
+runs once at the top of `run()`, before the interactive recording prompt — this
+required moving `MeetingStore()` construction from the end of `run()` to the start,
+and reusing that one instance for both the startup prune and the later insert (was
+previously constructed twice). A `retain_until` index was added alongside the existing
+`started_at` index. **The outside voice's real find here:** a `Meeting` row used to
+only get inserted after successful transcription — audio that failed to transcribe
+(missing model) got no row, no `retainUntil`, and was permanently exempt from
+retention. Fixed by moving the insert to immediately after recording stops, before
+transcription is attempted; `updateTranscript()` fills in the text later if
+transcription succeeds. TODOS.md "Data retention / deletion policy" entry updated.
+**Known limitation, accepted for this pass:** there's still no list/browse command
+anywhere in the CLI (`allMeetings()` is only called from tests) — audio gets deleted
+with no way to review it first. The outside voice recommended deferring the whole
+implementation until a browse command exists; the user explicitly chose to build it
+now anyway. Worth building a browse/list command before this policy runs unattended
+for long stretches.
 
-**MCP server auth model (Phase 2, not built now):** locked direction — Unix domain
-socket, file-permission scoped to the user's own account, not a TCP port with a bearer
-token. No token generation/rotation to manage; the OS already enforces "only processes
-running as you can connect."
+**DB migration.** `MeetingStore.createSchemaIfNeeded()` only ever did
+`CREATE TABLE IF NOT EXISTS`, which does nothing to a database that already exists —
+every real Phase 1 install. `migrateAddAudioDeletedAtColumnIfNeeded()` now checks
+`PRAGMA table_info(meetings)` and runs `ALTER TABLE ... ADD COLUMN audio_deleted_at REAL`
+if missing. Covered by `MeetingStoreTests.testOpeningPreExistingPhase1DatabaseMigratesWithoutCrashing`,
+which builds a real pre-migration fixture via raw SQLite (not via MeetingStore) to
+verify against.
 
-**Google Calendar write-back default (Phase 2, not built now):** locked to require
-per-item confirmation before creating a Calendar event from an extracted action item —
-mirrors the already-locked Gmail draft-only default. Rationale: Approach A (fully local
-via Ollama) already accepted lower extraction quality than a frontier model as a
-deliberate privacy tradeoff; auto-writing to a real Calendar directly from that
-extraction has real blast radius (wrong date, wrong inferred attendee) with no review
-step.
+**Speaker diarization → still deferred, now with a real gate.** whisper.cpp's
+experimental `tinydiarize` (`-tdrz`) was evaluated and rejected — it only detects
+speaker-turn changes, not verified identity, so labels drift once a 3rd+ speaker
+re-enters a conversation. User chose to keep researching a proper speaker-identity
+approach instead (e.g. a local pyannote-based sidecar). **Milestone gate (not a
+date):** must be decided — real diarization, or an explicit "ship Phase 2 unattributed"
+fallback — before the first line of Ollama action-item extraction code is written.
+This was chosen deliberately over a calendar deadline after the outside voice flagged
+that open-ended "keep researching" risks never actually resolving. TODOS.md entry
+updated with the full finding and the gate.
 
-**Code-quality fixes approved (not yet implemented):**
-1. `AudioRecorder.swift:94` — `try? audioFile.write(from: pcmBuffer)` currently silently
-   swallows write failures (e.g. disk full mid-recording → silent truncation, zero
-   signal). Fix: track a `lastError` set on failure; `stopRecording()` checks it and
-   throws a new `RecorderError.captureFailed(underlying:)` case after stopping capture.
-2. `AudioRecorder.swift:106-113` — `didStopWithError` (fires when ScreenCaptureKit stops
-   the stream unexpectedly, e.g. mic unplugged) currently only sets `isRecording = false`
-   and never stores the real error or nils `stream`/`audioFile`/`currentSession`. Fix:
-   store the error in the same slot as #1, clean up state, so a later `stopRecording()`
-   call surfaces the real cause instead of a generic `.notRecording`.
-3. `PermissionManager.checkMicrophonePermission()` couples a live `AVCaptureDevice` OS
-   call with branching logic that has zero test coverage. Extract a pure
-   `static func mapAuthorizationStatus(_ status: AVAuthorizationStatus) ->
-   RecordingPermissionStatus` so the mapping is directly unit-testable.
-4. New: `StorageLocation.parseFileVaultStatus(_ output: String) -> Bool` as a pure,
-   testable parser for `fdesetup status` output — **fail-closed**: unrecognized/empty
-   output should be treated as "off" (triggers the warning) rather than silently assumed
-   protected.
-5. New: a narrow `AudioFileWriting` protocol (`func write(from: AVAudioPCMBuffer) throws`)
-   injected into `AudioRecorder`'s initializer, which `AVAudioFile` already conforms to
-   structurally (defaulting to a real `AVAudioFile`-backed instance in production), so
-   fix #1's error path can be tested with a throwing test double instead of needing a
-   real disk-full condition. **See outside-voice finding #2 — this seam alone is not
-   enough to test the full `stopRecording()` → `captureFailed` path; `stream`,
-   `currentSession`, and `isRecording`'s setter are all `private` with no other seam.**
+**MCP server auth model (Phase 2, not built yet) → locked to Unix domain socket**,
+file-permission scoped to the user's account, not a TCP port with a bearer token.
+TODOS.md entry updated to record the direction so Phase 2 doesn't re-litigate it.
 
-**Test plan approved (none written yet):**
-- `PermissionManagerTests.swift` (new) — all 4 reachable `AVAuthorizationStatus` →
-  `RecordingPermissionStatus` mappings via `mapAuthorizationStatus`.
-- `StorageLocationTests.swift` (new) — `parseFileVaultStatus` for "On", "Off", and
-  unexpected/empty output (fail-closed).
-- `MeetingStoreTests.swift` (extend) — `deleteExpiredAudio`: expired+undeleted meeting
-  gets pruned; not-yet-expired meeting untouched; already-deleted meeting skipped
-  (idempotency); already-missing audio file on disk doesn't crash; opening a
-  pre-existing Phase-1-era DB file (no `audio_deleted_at` column) migrates without
-  crashing. **The last one is impossible as currently scoped — see outside-voice
-  finding #1.**
-- `AudioRecorderTests.swift` (new) — using the injectable `AudioFileWriting` double: a
-  throwing writer sets `lastError`; `stopRecording()` throws `captureFailed` when
-  `lastError` is set; `didStopWithError` clears `stream`/`audioFile`/`currentSession`
-  state. **The `stopRecording()`/`captureFailed` half of this is impossible as currently
-  scoped — see outside-voice finding #2.**
+**Google Calendar write-back (Phase 2, not built yet) → requires per-item
+confirmation** before creating an event from an extracted action item, mirroring the
+already-locked Gmail draft-only default. Not yet in TODOS.md as its own entry —
+recorded here and in this session's history; add one before Phase 2 Calendar work
+starts if it isn't already there.
 
-**Performance:** add a SQLite index on `retain_until` alongside the existing
-`started_at` index (near-zero cost, avoids a full table scan on `deleteExpiredAudio`'s
-query as meeting history grows over months/years of solo use).
+**Code-quality fixes (all implemented, all tested):**
+- `AudioRecorder.swift`: `write()` used to silently swallow errors via `try?`
+  (disk-full mid-recording → silent truncation). Now tracks `lastError`, surfaced by
+  `stopRecording()` throwing `RecorderError.captureFailed(underlying:)`.
+- `didStopWithError` (unexpected stream stop, e.g. mic unplugged) used to only set
+  `isRecording = false`. Now stores the real error and nils `stream`/`audioFile`/
+  `currentSession`; a later `stopRecording()` call surfaces the real cause instead of
+  a generic `.notRecording`.
+- New `AudioFileWriting` protocol (narrow seam around `AVAudioFile.write(from:)`,
+  `AVAudioFile` conforms structurally) injected via `AudioRecorder.audioFile`, so the
+  write-error path is unit-testable with a throwing double.
+- New `AudioRecorder.finalizeCaptureError(_:)` static pure function — the
+  throw-decision extracted so it's testable with no `AudioRecorder` instance or live
+  `SCStream` at all (the outside voice flagged that the original plan named an
+  untestable test; this is how it got resolved).
+- `PermissionManager.mapAuthorizationStatus(_:)` extracted as a pure function so the
+  `AVAuthorizationStatus` → `RecordingPermissionStatus` mapping has direct test
+  coverage instead of being coupled to a live TCC call.
 
-### Outside-voice findings — UNRESOLVED, this is the most important thing to do next
+**Tests added:** `PermissionManagerTests.swift`, `StorageLocationTests.swift`,
+`AudioRecorderTests.swift` (all new), plus 5 new cases in `MeetingStoreTests.swift`
+(retention pruning: expired/not-yet-expired/idempotent/missing-file, plus the legacy
+migration test). 22 tests total, all passing, including the pre-existing real
+end-to-end `WhisperTranscriberTests` case.
 
-An independent review (Claude subagent — Codex CLI wasn't installed on this machine, so
-it fell back per gstack's outside-voice protocol) was run against the plan above and
-found 6 concrete problems. **None of these were walked through with the user before the
-session ended.** Per gstack's rule, outside-voice findings are informational until
-individually presented via AskUserQuestion and approved/rejected by the user — do NOT
-silently apply any of these fixes without asking first, and do NOT silently ignore them
-either.
+### Remaining Work (Phase 2 — none of this has started)
 
-1. **[High] DB migration gap.** The plan promises a test for "opening a pre-existing
-   Phase-1-era DB file (no `audio_deleted_at` column) migrates without crashing," but
-   `MeetingStore.createSchemaIfNeeded()` only runs `CREATE TABLE IF NOT EXISTS`
-   (`MeetingStore.swift:39-50`) — that never adds a column to a table that already
-   exists. No `ALTER TABLE` / column-detection step was ever specified anywhere in the
-   approved fix list. As scoped, this promised test cannot pass against the user's real
-   existing local database (which already has rows from the verified Phase 1 test run).
-2. **[High] An untestable test was approved.** The `AudioRecorderTests` plan calls for
-   testing "`stopRecording()` throws `captureFailed` when `lastError` is set," but
-   `stream`, `currentSession` are fully `private` and `isRecording` is `private(set)`
-   (`AudioRecorder.swift:24-29`), with no injection seam besides the new
-   `AudioFileWriting` protocol, which only covers the `write()` path. A test can't drive
-   `stopRecording()` into that branch without live ScreenCaptureKit capture. Needs an
-   access-control or additional-seam decision that wasn't made.
-3. **[Medium] Sequencing was never actually wired.** The plan says
-   `deleteExpiredAudio(now:)` runs "before the interactive recording prompt," but
-   `MeetingStore()` is currently only constructed at the very end of `run()`
-   (`MeetingNoteTakerApp.swift:104`), after transcription completes. Nothing in the
-   approved fix list moves that construction earlier — as written, the feature has
-   nowhere to actually hook in.
-4. **[Medium-High] Retention has a silent blind spot.** When no Whisper model is found,
-   `run()` returns before `store.insert()` is ever called (`MeetingNoteTakerApp.swift:
-   86-89`) — that audio file gets no `Meeting` row, hence no `retainUntil`, and is
-   permanently exempt from the 7-day deletion policy. The audio most likely to sit
-   around indefinitely (never transcribed) is exactly the audio the retention system
-   can't see.
-5. **[Medium-High, STRATEGIC — resolve this one first, it reshapes the others.]**
-   There is no list/browse command anywhere in the current CLI —
-   `MeetingStore.allMeetings()` is only ever called from tests. The plan builds full
-   retention machinery (schema field, index, startup job, idempotency tests) for a
-   system that silently deletes files the user has no way to see or review first.
-   The outside voice's recommendation: **defer the retention *implementation* the same
-   way diarization got deferred** — record the policy decision in `TODOS.md` (already
-   done for the *decision*, see above) but don't build the deletion machinery until
-   there's a way to actually browse what's stored. If the user agrees with this, findings
-   #1, #3, and #4 become moot for this pass (nothing to migrate/wire/blind-spot-fix if
-   nothing gets built yet) — which is why this is the one to present first.
-6. **[Medium] Diarization deferral doesn't actually unblock Phase 2.** `TODOS.md`
-   states attribution must be decided "before Phase 2's Ollama-based action item
-   extraction work starts" since extraction/write-back depend on it. This session's plan
-   defers diarization to open-ended "research a proper approach" with no decision point
-   — so the pass meant to precede Phase 2 leaves Phase 2's own stated entry condition
-   unmet. Needs either a concrete research deadline/decision point, or an explicit
-   "ship Phase 2 with unattributed action items for now" fallback decision.
-
-### Remaining Work
-
-1. **First: present outside-voice finding #5 to the user** (defer retention
-   implementation entirely vs. build it now with fixes for #1/#3/#4) — this is the
-   pivotal call that reshapes the rest of the plan.
-2. Present findings #1, #2, #4, #6 individually via AskUserQuestion (one per call, per
-   gstack's cross-model-tension protocol) — even if #5 resolves in favor of deferring,
-   #2 and #6 are independent and still need resolving.
-3. Resolve the interrupted TODOS.md update: the user backed out of (did not reject, just
-   interrupted) a question about updating the "Speaker diarization" TODOS.md entry with
-   the tinydiarize finding. This is still genuinely open — ask again once the outside-
-   voice findings are cleared, don't assume either way.
-4. Once findings are resolved, the `/plan-eng-review` skill still has these required
-   outputs unfinished: Diagrams section, Failure modes section, Worktree parallelization
-   strategy, Implementation Tasks (markdown + JSONL artifact for `/autoplan`), Completion
-   summary, Review Log persistence (`gstack-review-log`), Review Readiness Dashboard,
-   Next Steps chaining (offer `/plan-design-review` / `/plan-ceo-review` if applicable).
-5. Only after the review is actually complete: implement the approved code-quality fixes
-   and (whichever subset of) the retention/FileVault/diarization-TODO work survives step
-   1-2, with tests, then re-verify `swift build && swift test` passes.
-6. Longer-horizon (Phase 2, scope already locked, no code yet): Ollama integration for
-   summarization/action-item extraction, MCP server (Unix-socket auth, per decisions
-   above), Google Calendar OAuth + confirm-before-write, Gmail OAuth + draft-only
-   write, and the real UI (replacing `readLine()`).
+1. **Diarization decision is gated** — resolve it (real approach, or explicit
+   unattributed fallback) before writing any Ollama action-item extraction code.
+2. Install and wire Ollama; prototype summarization/action-item extraction prompts
+   against real transcripts. Benchmark model choice (design doc suggested Llama 3.1 8B
+   or Qwen2.5 as starting candidates, never benchmarked).
+3. Build the MCP server — Unix domain socket auth (locked direction, see above), tool
+   surface: `search_meetings`, `get_transcript`, `get_summary`, `get_action_items`
+   (names proposed in the original design doc, not yet reconfirmed).
+4. Google Calendar OAuth + event creation, gated on per-item confirmation (locked
+   this session — add a TODOS.md entry for it if one doesn't exist yet).
+5. Gmail OAuth + draft creation for follow-ups (draft-only, never auto-send — already
+   locked).
+6. The real UI, replacing the `readLine()`-based CLI — explicitly scoped into Phase 2,
+   not before.
+7. Consider building a meetings browse/list command sooner rather than later — the
+   retention policy is now silently deleting audio with no way to review it first,
+   which is a real limitation the outside voice flagged and the user knowingly accepted
+   for this pass only.
 
 ### Notes
 
-- `TODOS.md` in the repo root is committed and will transfer via git normally — it
-  currently has 7 entries: accepted iCloud risk, speaker diarization, data retention,
-  remote-participant consent notification (manual verbal announcement required starting
-  with the first real-meeting test — already in effect, printed every `run()`), re-test
-  Metal GPU on Apple Silicon, MCP server auth model, encryption at rest. Read it before
-  making changes — some of the decisions above should update it (see Remaining Work #3)
-  but that update was never actually written.
-- The design doc, test-plan artifact, and tasks JSONL from the original Phase 1 eng
-  review live under `~/.gstack/projects/meetingnotetaker/` on **this** machine only —
-  they do not transfer with `git clone`. Everything load-bearing from them is already
-  inlined above (Approach A rationale, success criteria, locked precedents like the
-  Gmail draft-only default). If deeper original context is ever needed and this machine
-  is reachable, the design doc is at
-  `~/.gstack/projects/meetingnotetaker/SaiKasam-unknown-design-20260809-154322.md`.
-- This project uses the gstack skill framework (routing rules are in the repo's
-  `CLAUDE.md`) — `/plan-eng-review` is the in-progress skill this session was running
-  when it got interrupted. On the new machine, gstack needs to be installed/available
-  for that skill to exist (`~/.claude/skills/gstack/`) — if it isn't, either install it
-  or just continue the review manually using the state captured in this document; the
-  substance (the 6 outside-voice findings, the locked decisions) doesn't require the
-  skill tooling itself to act on.
-- Nothing is currently uncommitted on `main` — working tree is clean as of this save.
+- `TODOS.md` in the repo root is committed and transfers via git normally. All entries
+  touched this session (diarization, encryption, MCP auth, retention) were updated
+  with the actual decisions and rationale, not just left as open questions — read it
+  before making related changes.
+- Nothing is currently uncommitted on `main`.
+- This project uses the gstack skill framework (routing rules in the repo's
+  `CLAUDE.md`). `/plan-eng-review` was used for this hardening pass. If gstack isn't
+  available on a new machine, the substance in this document doesn't require the
+  skill tooling to act on.

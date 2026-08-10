@@ -24,6 +24,12 @@ struct MeetingNoteTakerApp {
             .appendingPathComponent("Vendor/whisper.cpp/models/ggml-small.en.bin")
     }
 
+    /// Grace period between recording and audio becoming eligible for
+    /// automatic deletion — see TODOS.md "Data retention / deletion policy".
+    /// Long enough to notice and re-run a bad transcription against the
+    /// source audio before it's gone.
+    private static let audioRetentionGracePeriod: TimeInterval = 7 * 24 * 60 * 60
+
     static func main() async {
         do {
             try await run()
@@ -37,6 +43,29 @@ struct MeetingNoteTakerApp {
         let recovery = RecordingRecovery()
         if let orphan = recovery.detectOrphanedRecording() {
             handleOrphanedRecording(orphan, recovery: recovery)
+        }
+
+        // FileVault is the accepted v1 data-at-rest boundary (see TODOS.md
+        // "Encryption at rest") — warn, don't block, matching the same
+        // accepted-risk posture already used for the iCloud-exclusion
+        // mitigation in StorageLocation.
+        if !StorageLocation.isFileVaultEnabled() {
+            print("""
+
+            ────────────────────────────────────────────────────────────
+            Warning: FileVault is not enabled. This app relies on
+            FileVault as its only data-at-rest protection (see TODOS.md
+            "Encryption at rest") — without it, meeting recordings and
+            transcripts are stored unencrypted on disk. Enable it in
+            System Settings > Privacy & Security > FileVault.
+            ────────────────────────────────────────────────────────────
+            """)
+        }
+
+        let store = try MeetingStore()
+        let pruned = try store.deleteExpiredAudio()
+        if !pruned.isEmpty {
+            print("Deleted \(pruned.count) audio file(s) past the \(Int(audioRetentionGracePeriod / 86_400))-day retention window (transcripts kept).")
         }
 
         let micStatus = PermissionManager.checkMicrophonePermission()
@@ -83,6 +112,24 @@ struct MeetingNoteTakerApp {
         let finishedSession = try await recorder.stopRecording()
         print("Stopped. Audio saved to \(finishedSession.audioFileURL.path)")
 
+        // Insert the Meeting row immediately, before attempting
+        // transcription — not after. Audio that fails to transcribe (e.g.
+        // no model found) used to get no DB row at all, which meant no
+        // retainUntil and permanent exemption from the retention policy
+        // above: exactly the audio most likely to sit around unreviewed.
+        // retainUntil is anchored to the recording, not to a successful
+        // transcript, so it applies uniformly either way.
+        let meeting = Meeting(
+            id: session.id,
+            startedAt: finishedSession.startedAt,
+            endedAt: finishedSession.endedAt,
+            audioFilePath: finishedSession.audioFileURL.path,
+            transcriptText: nil,
+            retainUntil: finishedSession.startedAt.addingTimeInterval(audioRetentionGracePeriod),
+            audioDeletedAt: nil
+        )
+        try store.insert(meeting)
+
         guard FileManager.default.fileExists(atPath: modelPath.path) else {
             print("No Whisper model found at \(modelPath.path) — skipping transcription. Audio is saved; run transcription later once a model is available.")
             return
@@ -101,16 +148,7 @@ struct MeetingNoteTakerApp {
         }
         print("\nTranscript:\n\(transcript)")
 
-        let store = try MeetingStore()
-        let meeting = Meeting(
-            id: session.id,
-            startedAt: finishedSession.startedAt,
-            endedAt: finishedSession.endedAt,
-            audioFilePath: finishedSession.audioFileURL.path,
-            transcriptText: transcript,
-            retainUntil: nil
-        )
-        try store.insert(meeting)
+        try store.updateTranscript(meetingID: meeting.id, transcript: transcript)
         print("Saved to local store: \(StorageLocation.databaseURL.path)")
     }
 
