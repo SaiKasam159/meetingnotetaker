@@ -7,6 +7,22 @@ files_modified: []
 
 ## Working on: meetingnotetaker — Phase 1 hardened, Phase 2 in progress (Ollama summarization + MCP server built; Calendar/Gmail/UI not started)
 
+### PAUSED HERE (2026-08-11) — read this first
+
+Session stopped by explicit user request at a clean point: working tree is clean, the
+MCP server commit (`c9427f0`) is pushed to `origin/main`, all 59 tests pass. Nothing is
+half-finished or mid-edit. Before stopping, three options for what's next were
+presented and the user chose to pause instead of picking one — so **the next session
+should ask what to prioritize, not assume**:
+1. Benchmark `llama3.1:8b` vs Qwen2.5 7B on real transcripts (doable solo, no user
+   action needed).
+2. User connects the MCP config to a real Claude client and confirms it works from an
+   actual conversation, plus runs the full interactive record→transcribe→summarize
+   test (both need the user, not more code).
+3. User sets up a Google Cloud project + OAuth consent screen so Calendar/Gmail work
+   can start (needs the user).
+See "Remaining Work" below for the complete list this pause point applies to.
+
 ### Summary
 
 meetingnotetaker is a local-first macOS replica of Granola: record meetings (mic +
@@ -15,11 +31,14 @@ except a narrow bounded exception for user-initiated Google Calendar/Gmail write
 **Phase 1 is fully built, hardened, tested, and committed** — verified end-to-end
 against a real recording, then hardened (FileVault boundary, audio retention,
 error-surfacing fixes) through a full `/plan-eng-review` with all 22 tests passing.
-**Phase 2 has started:** Ollama is installed and wired for local summarization (33
-tests passing total), with a real finding along the way — Ollama has an optional
-cloud-inference feature that had to be explicitly locked out to keep the "100% local"
-guarantee. MCP server, Google Calendar/Gmail write-back, and the real UI (replacing
-the current `readLine()` CLI) have not started.
+**Phase 2 is in progress:** Ollama summarization, a meetings browse/list CLI command,
+and an MCP server (stdio, official Swift SDK) are all built, tested, and manually
+verified live — 59 tests passing total. Two real findings surfaced and got corrected
+along the way: Ollama's optional cloud-inference feature had to be explicitly locked
+out, and the MCP server's originally-locked Unix-socket auth design turned out to be
+based on a wrong assumption about how Claude actually launches local servers (see
+TODOS.md for both). Google Calendar/Gmail write-back and the real UI (replacing the
+current `readLine()` CLI) have not started.
 
 ### Repo / environment this assumes
 
