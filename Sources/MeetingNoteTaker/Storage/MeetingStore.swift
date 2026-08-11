@@ -23,7 +23,13 @@ struct Meeting: Identifiable {
 /// Local-only persistence: SQLite for structured metadata + queryable
 /// transcript text, flat files under StorageLocation.recordingsDirectory for
 /// the raw audio itself. No network access anywhere in this type.
-final class MeetingStore {
+///
+/// @unchecked Sendable: the underlying sqlite3 connection isn't inherently
+/// thread-safe, but every call site in this codebase (the sequential
+/// recording pipeline, and the MCP server's single-client stdio handler)
+/// only ever calls into a given MeetingStore instance serially, never
+/// concurrently.
+final class MeetingStore: @unchecked Sendable {
     private var db: OpaquePointer?
 
     convenience init() throws {

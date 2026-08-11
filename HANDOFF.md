@@ -1,11 +1,11 @@
 ---
 status: in-progress
 branch: main
-timestamp: 2026-08-10T21:00:00Z
+timestamp: 2026-08-11T13:15:00Z
 files_modified: []
 ---
 
-## Working on: meetingnotetaker — Phase 1 hardened, Phase 2 in progress (Ollama summarization built; MCP/Calendar/Gmail/UI not started)
+## Working on: meetingnotetaker — Phase 1 hardened, Phase 2 in progress (Ollama summarization + MCP server built; Calendar/Gmail/UI not started)
 
 ### Summary
 
@@ -304,16 +304,81 @@ confirmation**, keeping the one genuine recording from Phase 1's end-to-end veri
 
 **Tests added:** `MeetingBrowserTests.swift` (new). 45 tests total, all passing.
 
+### MCP server — IMPLEMENTED, TESTED, VERIFIED LIVE (2026-08-11)
+
+**Course correction before building anything:** the hardening pass had locked "Unix
+domain socket, file-permission scoped" as the MCP auth model, based on a threat model
+(any local process could connect to a persistent daemon) that turned out not to apply.
+Verified against Claude Desktop's own docs: local MCP servers are **stdio-launched
+subprocesses only** — Claude spawns the binary itself and talks over that process's own
+stdin/stdout, which no other process can attach to at all. Stronger guarantee than a
+socket file, and needs no auth design of its own. TODOS.md's "MCP server auth model"
+entry records this as a reversed decision, not a silent swap — see it for the full
+reasoning. This is exactly the kind of premise-check that's worth doing before writing
+code, not after.
+
+Built on the **official Swift MCP SDK** (`github.com/modelcontextprotocol/swift-sdk`,
+added as a Package.swift dependency, product `MCP`) rather than hand-rolling JSON-RPC —
+verified its API against the actual repo source (README + `Sources/MCP/Server/Tools.swift`)
+before writing code, not guessed.
+
+- **New subcommand: `meetingnotetaker mcp-serve`** — dispatched in `main()` alongside
+  `list`/`show`. Not meant to be run interactively; a client launches it and talks MCP
+  over its stdio.
+- **`MCPServer.swift`** registers three tools against the existing `MeetingStore` (no
+  new storage, reads what the recording pipeline already writes):
+  - `search_meetings(query?)` — case-insensitive substring match across transcripts
+    and summaries; omit query to list everything. Reuses `MeetingBrowser.listLine` for
+    formatting (DRY with the `list` CLI command).
+  - `get_transcript(meetingIndex)` / `get_summary(meetingIndex)` — full text by the
+    1-based index from the most recent `search_meetings` call (same friendly-numbering
+    convention as `show <n>`, not a UUID).
+  - **`get_action_items` is deliberately NOT exposed** — action-item extraction doesn't
+    exist yet, still gated on the diarization decision (see below).
+- All tool logic (`searchMeetings`, `transcript`, `summary`, `meetingIndex` parsing) is
+  pure and unit-tested against a temp `MeetingStore` — no live MCP transport needed for
+  test coverage. `MeetingStore` was marked `@unchecked Sendable` (single-threaded
+  access in practice: the sequential recording pipeline and MCP's one-client stdio
+  handler never call it concurrently) to satisfy Swift 6 strict concurrency in the
+  `@Sendable` tool-call closure.
+- **Manually verified live**, not just unit tests: piped a real MCP JSON-RPC handshake
+  (`initialize` → `notifications/initialized` → `tools/list` → `tools/call
+  search_meetings`) into the built binary's `mcp-serve` subcommand over stdin.
+  `tools/list` returned all 3 tools with correct schemas; `search_meetings` correctly
+  returned the one real meeting in the database. Full transcript of that verification
+  run is in this session's history if it needs re-checking.
+
+**To actually connect Claude Desktop or Claude Code to this**, add to
+`claude_desktop_config.json` (Desktop) or the equivalent Claude Code MCP config:
+```json
+{
+  "mcpServers": {
+    "meetingnotetaker": {
+      "command": "/Users/SaiKasam/meetingnotetaker/.build/debug/MeetingNoteTaker",
+      "args": ["mcp-serve"]
+    }
+  }
+}
+```
+(Use a release build's path once one exists — `swift build -c release`.) **This
+config step has NOT been done yet** — the server works when driven manually, but no one
+has pointed an actual Claude client at it.
+
+**Tests added:** `MCPServerTests.swift` (new), plus `TestSupport.swift` extracting the
+temp-store helper that both `MeetingStoreTests` and `MCPServerTests` now share (was
+duplicated `private` inside `MeetingStoreTests` before). 59 tests total, all passing.
+
 ### Remaining Work (Phase 2)
 
 1. **Diarization decision is gated** — resolve it (real approach, or explicit
    unattributed fallback) before writing any Ollama action-item extraction code.
-   Summarization (done, see above) didn't need this; action-item extraction does.
+   Summarization (done above) didn't need this; action-item extraction does, and so
+   does exposing `get_action_items` from the MCP server.
 2. Benchmark `llama3.1:8b` vs Qwen2.5 7B on real transcripts — never done, design doc
    flagged as needed.
-3. Build the MCP server — Unix domain socket auth (locked direction, see above), tool
-   surface: `search_meetings`, `get_transcript`, `get_summary`, `get_action_items`
-   (names proposed in the original design doc, not yet reconfirmed).
+3. Actually configure a Claude client (Desktop or Code) to launch the MCP server (see
+   config snippet above) and confirm it works from inside a real Claude conversation,
+   not just a manual stdio test.
 4. Google Calendar OAuth + event creation, gated on per-item confirmation (locked
    this session — add a TODOS.md entry for it if one doesn't exist yet).
 5. Gmail OAuth + draft creation for follow-ups (draft-only, never auto-send — already

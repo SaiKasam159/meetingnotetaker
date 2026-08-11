@@ -5,7 +5,7 @@ import SQLite3
 
 final class MeetingStoreTests: XCTestCase {
     func testInsertAndFetchMeeting() throws {
-        let (store, _) = try makeTempStore()
+        let (store, _) = try makeTempMeetingStore()
         let meeting = Meeting(
             id: UUID(),
             startedAt: Date(),
@@ -21,7 +21,7 @@ final class MeetingStoreTests: XCTestCase {
     }
 
     func testUpdateTranscriptPersists() throws {
-        let (store, _) = try makeTempStore()
+        let (store, _) = try makeTempMeetingStore()
         let meeting = Meeting(
             id: UUID(),
             startedAt: Date(),
@@ -39,21 +39,8 @@ final class MeetingStoreTests: XCTestCase {
 
     // MARK: - deleteExpiredAudio
 
-    private func makeTempStore() throws -> (MeetingStore, URL) {
-        let dbURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("meetingstore-test-\(UUID().uuidString).sqlite3")
-        return (try MeetingStore(databaseURL: dbURL), dbURL)
-    }
-
-    private func makeTempAudioFile() throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("audio-test-\(UUID().uuidString).caf")
-        try Data("fake audio".utf8).write(to: url)
-        return url
-    }
-
     func testDeleteExpiredAudioPrunesExpiredMeeting() throws {
-        let (store, _) = try makeTempStore()
+        let (store, _) = try makeTempMeetingStore()
         let audioURL = try makeTempAudioFile()
         let meeting = Meeting(
             id: UUID(),
@@ -75,7 +62,7 @@ final class MeetingStoreTests: XCTestCase {
     }
 
     func testDeleteExpiredAudioLeavesNotYetExpiredMeetingUntouched() throws {
-        let (store, _) = try makeTempStore()
+        let (store, _) = try makeTempMeetingStore()
         let audioURL = try makeTempAudioFile()
         let meeting = Meeting(
             id: UUID(),
@@ -95,7 +82,7 @@ final class MeetingStoreTests: XCTestCase {
     }
 
     func testDeleteExpiredAudioSkipsAlreadyDeletedMeeting() throws {
-        let (store, _) = try makeTempStore()
+        let (store, _) = try makeTempMeetingStore()
         let meeting = Meeting(
             id: UUID(),
             startedAt: Date(),
@@ -113,7 +100,7 @@ final class MeetingStoreTests: XCTestCase {
     }
 
     func testDeleteExpiredAudioToleratesAlreadyMissingFile() throws {
-        let (store, _) = try makeTempStore()
+        let (store, _) = try makeTempMeetingStore()
         let meeting = Meeting(
             id: UUID(),
             startedAt: Date(),

@@ -10,6 +10,13 @@ let package = Package(
         // requires macOS 15+.
         .macOS(.v15)
     ],
+    dependencies: [
+        // Official Swift MCP SDK — used for the Phase 2 MCP server (stdio
+        // transport, launched as a subprocess by Claude Desktop/Code; see
+        // TODOS.md "MCP server auth model" for why stdio replaced an
+        // earlier Unix-socket design).
+        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.11.0")
+    ],
     targets: [
         // Header-only shim exposing whisper.cpp's C API (Vendor/whisper.cpp,
         // vendored as a git submodule pinned to v1.9.2) to Swift. No sources
@@ -28,7 +35,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "MeetingNoteTaker",
-            dependencies: ["CWhisper"],
+            dependencies: [
+                "CWhisper",
+                .product(name: "MCP", package: "swift-sdk")
+            ],
             path: "Sources/MeetingNoteTaker",
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
@@ -59,7 +69,10 @@ let package = Package(
         ),
         .testTarget(
             name: "MeetingNoteTakerTests",
-            dependencies: ["MeetingNoteTaker"],
+            dependencies: [
+                "MeetingNoteTaker",
+                .product(name: "MCP", package: "swift-sdk")
+            ],
             path: "Tests/MeetingNoteTakerTests"
         )
     ]

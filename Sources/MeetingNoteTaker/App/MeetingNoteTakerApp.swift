@@ -34,7 +34,7 @@ struct MeetingNoteTakerApp {
         do {
             let arguments = Array(CommandLine.arguments.dropFirst())
             if let command = arguments.first {
-                try handleCommand(command, remaining: Array(arguments.dropFirst()))
+                try await handleCommand(command, remaining: Array(arguments.dropFirst()))
             } else {
                 try await run()
             }
@@ -48,7 +48,7 @@ struct MeetingNoteTakerApp {
     /// flow's mic/screen-recording permission prompts or consent reminder,
     /// so this is handled entirely separately from run(), before any of
     /// that setup.
-    private static func handleCommand(_ command: String, remaining: [String]) throws {
+    private static func handleCommand(_ command: String, remaining: [String]) async throws {
         switch command {
         case "list":
             let store = try MeetingStore()
@@ -60,8 +60,13 @@ struct MeetingNoteTakerApp {
             }
             let store = try MeetingStore()
             MeetingBrowser.printDetail(try store.allMeetings(), index: index)
+        case "mcp-serve":
+            // Launched by an MCP client (Claude Desktop/Code) as a
+            // subprocess talking over this process's own stdin/stdout — not
+            // meant to be run interactively. See MCPServer.swift.
+            try await MCPServer.run()
         default:
-            print("Unknown command '\(command)'. Usage: meetingnotetaker [list | show <number>]")
+            print("Unknown command '\(command)'. Usage: meetingnotetaker [list | show <number> | mcp-serve]")
         }
     }
 

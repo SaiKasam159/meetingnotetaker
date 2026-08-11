@@ -53,15 +53,16 @@ Captured during `/plan-eng-review` on 2026-08-09, deferred from Phase 1 (audio c
 **Context:** See `WhisperTranscriber.runWhisperFull`'s inline comment for the full finding. The end-to-end test (`WhisperTranscriberTests.testTranscribesKnownSampleAudio`) is the regression test to re-run with `use_gpu = true` when testing on Apple Silicon.
 **Depends on / blocked by:** Access to an Apple Silicon Mac for testing.
 
-## MCP server auth model (Phase 2)
+## MCP server auth model (Phase 2) — RESOLVED, decision reversed 2026-08-11
 
-**What:** Decide and implement an auth model for the Phase 2 MCP server before it ships — e.g. a local auth token, or a Unix socket scoped by file permissions rather than an open TCP port.
-**Why:** An unauthenticated localhost server exposing "search all meeting transcripts" is a new local attack surface — any other local process could query it. This undercuts the "nothing leaves the device except the bounded Calendar/Gmail exception" pitch, since the exception list never accounted for other local processes reaching in.
-**Decision (locked 2026-08-10, during Phase 1 hardening pass):** Unix domain socket, scoped by file permissions to the user's own account — not a TCP port with a bearer token. No token generation, storage, or rotation to manage; the OS already enforces "only processes running as you can connect."
-**Pros:** Closes a real gap in the local-only threat model before it exists, not after. Zero token-lifecycle complexity.
-**Cons:** Adds design work to Phase 2's MCP server scope. Doesn't block Phase 1.
-**Context:** Surfaced by the outside-voice cross-model review during eng review. Not caught by the original architecture review since MCP wasn't in scope for Phase 1. Direction locked during the Phase 1 hardening pass even though implementation waits for Phase 2, so this doesn't get re-litigated later.
-**Depends on / blocked by:** Phase 2 MCP server implementation (direction is decided; only the build is pending).
+**What:** Decide and implement an auth model for the Phase 2 MCP server before it ships.
+**Why:** An unauthenticated localhost server exposing "search all meeting transcripts" would be a new local attack surface — any other local process could query it. This undercuts the "nothing leaves the device except the bounded Calendar/Gmail exception" pitch, since the exception list never accounted for other local processes reaching in.
+**Original decision (locked 2026-08-10, during Phase 1 hardening pass):** Unix domain socket, scoped by file permissions to the user's own account — not a TCP port with a bearer token.
+**Reversed 2026-08-11, while starting the actual MCP server build:** The Unix-socket decision assumed a threat model that doesn't apply — a persistent daemon that any local process could discover and connect to. That's not how local MCP servers actually get used: Claude Desktop and Claude Code only support **stdio-launched subprocesses** for local servers (confirmed via Claude Desktop's own docs — "Claude Desktop's local config schema validates stdio servers only"). Claude spawns the server binary itself and talks to it over that process's own stdin/stdout pipes, which no other process can attach to — no socket file, no daemon, no discoverable auth surface at all. This is a *stronger* guarantee than a Unix socket (which, despite file permissions, is still a named filesystem object any process running as the user's UID could in principle open) and requires no design work of its own — the official Swift MCP SDK's `StdioTransport` handles it directly.
+**Pros:** Simpler implementation than the original plan (no socket lifecycle, no "is a server already running" reuse logic, no daemon supervision) *and* a stronger security property, for free.
+**Cons:** None identified — this was a correction of a flawed premise, not a real tradeoff.
+**Context:** The original decision was made during the hardening pass's outside-voice review without checking how Claude actually integrates with local MCP servers. Caught while starting the real implementation and verified against Claude Desktop's documented config schema before reversing.
+**Depends on / blocked by:** None — implementation proceeds using stdio transport.
 
 ## Encryption at rest
 
