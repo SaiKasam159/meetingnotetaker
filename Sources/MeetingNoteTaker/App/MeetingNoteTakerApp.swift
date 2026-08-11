@@ -32,10 +32,36 @@ struct MeetingNoteTakerApp {
 
     static func main() async {
         do {
-            try await run()
+            let arguments = Array(CommandLine.arguments.dropFirst())
+            if let command = arguments.first {
+                try handleCommand(command, remaining: Array(arguments.dropFirst()))
+            } else {
+                try await run()
+            }
         } catch {
             FileHandle.standardError.write("Fatal: \(error)\n".data(using: .utf8)!)
             exit(1)
+        }
+    }
+
+    /// `list`/`show` are browse-only — they must not trigger the recording
+    /// flow's mic/screen-recording permission prompts or consent reminder,
+    /// so this is handled entirely separately from run(), before any of
+    /// that setup.
+    private static func handleCommand(_ command: String, remaining: [String]) throws {
+        switch command {
+        case "list":
+            let store = try MeetingStore()
+            MeetingBrowser.printList(try store.allMeetings())
+        case "show":
+            guard let indexArg = remaining.first, let index = Int(indexArg) else {
+                print("Usage: meetingnotetaker show <number>  (see `meetingnotetaker list` for numbers)")
+                return
+            }
+            let store = try MeetingStore()
+            MeetingBrowser.printDetail(try store.allMeetings(), index: index)
+        default:
+            print("Unknown command '\(command)'. Usage: meetingnotetaker [list | show <number>]")
         }
     }
 

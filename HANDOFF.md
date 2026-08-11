@@ -274,6 +274,36 @@ new). 33 tests total, all passing.
 Qwen2.5 7B for quality, and action-item extraction (separate from summarization) —
 still gated on the diarization decision below.
 
+### Meetings browse/list command — IMPLEMENTED, TESTED (2026-08-11)
+
+Closes the retention-visibility gap accepted during the hardening pass. New CLI
+subcommands, dispatched in `main()` before any of `run()`'s permission/recording setup
+(so browsing never triggers mic/screen-recording prompts):
+- `meetingnotetaker list` — numbered (1..N, most-recent-first, matches `allMeetings()`
+  ordering), shows date, duration, audio retention status ("audio kept, deletes in Nd" /
+  "audio deleted" / "audio kept (deletion pending...)"), and an 80-char transcript +
+  summary preview.
+- `meetingnotetaker show <number>` — full transcript + summary for one meeting, using
+  the number from `list` output (not a UUID — friendlier to type). Out-of-range numbers
+  print a usage hint instead of crashing.
+
+All formatting logic (`MeetingBrowser.swift`) is pure and unit-tested — `audioStatus`,
+`preview`, `durationString`, `daysUntilExpiry`, plus a bounds-safety test for `show`
+with an empty list / index 0 / an index past the end.
+
+**Real bug found and fixed while manually verifying this against the actual local
+database:** `MeetingStoreTests.testInsertAndFetchMeeting` and `testUpdateTranscriptPersists`
+were calling `try MeetingStore()` — which opens the **real** `~/Documents/MeetingNoteTaker/meetings.sqlite3`,
+not an isolated test database like the 5 retention tests added during the hardening
+pass (which correctly use `makeTempStore()`). Every `swift test` run had been silently
+inserting fake "hello world" meetings into the real database — invisible until this
+browse command made it visible. Fixed both tests to use `makeTempStore()`; confirmed
+`swift test` no longer touches the real DB (row count unchanged before/after a test
+run). **The real database had 12 junk rows from past test runs — deleted after explicit
+confirmation**, keeping the one genuine recording from Phase 1's end-to-end verification.
+
+**Tests added:** `MeetingBrowserTests.swift` (new). 45 tests total, all passing.
+
 ### Remaining Work (Phase 2)
 
 1. **Diarization decision is gated** — resolve it (real approach, or explicit
@@ -290,22 +320,26 @@ still gated on the diarization decision below.
    locked).
 6. The real UI, replacing the `readLine()`-based CLI — explicitly scoped into Phase 2,
    not before.
-7. Consider building a meetings browse/list command sooner rather than later — the
-   retention policy is now silently deleting audio with no way to review it first,
-   which is a real limitation the outside voice flagged and the user knowingly accepted
-   for this pass only.
-8. Interactively test the full record → transcribe → summarize flow end-to-end against
+7. Interactively test the full record → transcribe → summarize flow end-to-end against
    a real meeting — only the summarization HTTP call has been verified live so far
    (via curl), not the wired `run()` path.
 
 ### Notes
 
 - `TODOS.md` in the repo root is committed and transfers via git normally. All entries
-  touched this session (diarization, encryption, MCP auth, retention) were updated
-  with the actual decisions and rationale, not just left as open questions — read it
-  before making related changes.
+  touched this session (diarization, encryption, MCP auth, retention, Ollama cloud
+  lockout) were updated with the actual decisions and rationale, not just left as open
+  questions — read it before making related changes.
+- **Every commit gets pushed to `origin` (`https://github.com/SaiKasam159/meetingnotetaker.git`)
+  immediately** — this is now standing practice for this project, not a one-off. `main`
+  tracks `origin/main` directly; check `git status -sb` before pushing to confirm no
+  divergence.
 - Nothing is currently uncommitted on `main`.
 - This project uses the gstack skill framework (routing rules in the repo's
-  `CLAUDE.md`). `/plan-eng-review` was used for this hardening pass. If gstack isn't
+  `CLAUDE.md`). `/plan-eng-review` was used for the hardening pass. If gstack isn't
   available on a new machine, the substance in this document doesn't require the
   skill tooling to act on.
+- **Test isolation matters in this codebase.** `MeetingStoreTests` learned the hard way
+  that `try MeetingStore()` opens the real on-disk database — always use
+  `makeTempStore()` (defined in that file) for anything that inserts data, unless a
+  test is deliberately exercising the real-path convenience initializer.

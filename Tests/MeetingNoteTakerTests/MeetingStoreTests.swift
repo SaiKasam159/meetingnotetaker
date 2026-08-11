@@ -5,7 +5,7 @@ import SQLite3
 
 final class MeetingStoreTests: XCTestCase {
     func testInsertAndFetchMeeting() throws {
-        let store = try MeetingStore()
+        let (store, _) = try makeTempStore()
         let meeting = Meeting(
             id: UUID(),
             startedAt: Date(),
@@ -21,7 +21,7 @@ final class MeetingStoreTests: XCTestCase {
     }
 
     func testUpdateTranscriptPersists() throws {
-        let store = try MeetingStore()
+        let (store, _) = try makeTempStore()
         let meeting = Meeting(
             id: UUID(),
             startedAt: Date(),
