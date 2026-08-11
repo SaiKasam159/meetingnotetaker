@@ -15,6 +15,9 @@ struct Meeting: Identifiable {
     /// record — this field is the explicit signal callers must check before
     /// assuming the file at audioFilePath still exists.
     var audioDeletedAt: Date?
+    /// Local-LLM-generated summary (Phase 2, via Ollama). nil until
+    /// summarization has run for this meeting.
+    var summaryText: String? = nil
 }
 
 /// Local-only persistence: SQLite for structured metadata + queryable
@@ -56,20 +59,22 @@ final class MeetingStore {
             audio_file_path TEXT NOT NULL,
             transcript_text TEXT,
             retain_until REAL,
-            audio_deleted_at REAL
+            audio_deleted_at REAL,
+            summary_text TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_meetings_started_at ON meetings(started_at);
         CREATE INDEX IF NOT EXISTS idx_meetings_retain_until ON meetings(retain_until);
         """)
         // CREATE TABLE IF NOT EXISTS only creates the full schema on a brand
         // new database — it does nothing to a database that already exists
-        // from before audio_deleted_at was added (every Phase 1 install).
-        // This migration closes that gap explicitly rather than assuming a
-        // fresh install.
-        try migrateAddAudioDeletedAtColumnIfNeeded()
+        // from before a given column was added (every real install predates
+        // at least audio_deleted_at). Each column added after the original
+        // Phase 1 schema needs an explicit migration entry here.
+        try ensureColumnExists("audio_deleted_at", type: "REAL")
+        try ensureColumnExists("summary_text", type: "TEXT")
     }
 
-    private func migrateAddAudioDeletedAtColumnIfNeeded() throws {
+    private func ensureColumnExists(_ column: String, type: String) throws {
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
         guard sqlite3_prepare_v2(db, "PRAGMA table_info(meetings);", -1, &statement, nil) == SQLITE_OK else {
@@ -78,13 +83,13 @@ final class MeetingStore {
         var hasColumn = false
         while sqlite3_step(statement) == SQLITE_ROW {
             if let nameCString = sqlite3_column_text(statement, 1),
-               String(cString: nameCString) == "audio_deleted_at" {
+               String(cString: nameCString) == column {
                 hasColumn = true
                 break
             }
         }
         guard !hasColumn else { return }
-        try exec("ALTER TABLE meetings ADD COLUMN audio_deleted_at REAL;")
+        try exec("ALTER TABLE meetings ADD COLUMN \(column) \(type);")
     }
 
     private func exec(_ sql: String) throws {
@@ -98,8 +103,8 @@ final class MeetingStore {
 
     func insert(_ meeting: Meeting) throws {
         let sql = """
-        INSERT INTO meetings (id, started_at, ended_at, audio_file_path, transcript_text, retain_until, audio_deleted_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?);
+        INSERT INTO meetings (id, started_at, ended_at, audio_file_path, transcript_text, retain_until, audio_deleted_at, summary_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
         """
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
@@ -111,13 +116,10 @@ final class MeetingStore {
         sqlite3_bind_double(statement, 2, meeting.startedAt.timeIntervalSince1970)
         bindOptionalDate(statement, 3, meeting.endedAt)
         sqlite3_bind_text(statement, 4, meeting.audioFilePath, -1, SQLITE_TRANSIENT)
-        if let transcript = meeting.transcriptText {
-            sqlite3_bind_text(statement, 5, transcript, -1, SQLITE_TRANSIENT)
-        } else {
-            sqlite3_bind_null(statement, 5)
-        }
+        bindOptionalText(statement, 5, meeting.transcriptText)
         bindOptionalDate(statement, 6, meeting.retainUntil)
         bindOptionalDate(statement, 7, meeting.audioDeletedAt)
+        bindOptionalText(statement, 8, meeting.summaryText)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw StoreError.execFailed(String(cString: sqlite3_errmsg(db)))
@@ -132,14 +134,30 @@ final class MeetingStore {
         }
     }
 
+    private func bindOptionalText(_ statement: OpaquePointer?, _ index: Int32, _ text: String?) {
+        if let text {
+            sqlite3_bind_text(statement, index, text, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(statement, index)
+        }
+    }
+
     func updateTranscript(meetingID: UUID, transcript: String) throws {
-        let sql = "UPDATE meetings SET transcript_text = ? WHERE id = ?;"
+        try updateTextColumn("transcript_text", meetingID: meetingID, value: transcript)
+    }
+
+    func updateSummary(meetingID: UUID, summary: String) throws {
+        try updateTextColumn("summary_text", meetingID: meetingID, value: summary)
+    }
+
+    private func updateTextColumn(_ column: String, meetingID: UUID, value: String) throws {
+        let sql = "UPDATE meetings SET \(column) = ? WHERE id = ?;"
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
             throw StoreError.execFailed(String(cString: sqlite3_errmsg(db)))
         }
-        sqlite3_bind_text(statement, 1, transcript, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 1, value, -1, SQLITE_TRANSIENT)
         sqlite3_bind_text(statement, 2, meetingID.uuidString, -1, SQLITE_TRANSIENT)
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw StoreError.execFailed(String(cString: sqlite3_errmsg(db)))
@@ -161,7 +179,7 @@ final class MeetingStore {
     }
 
     func allMeetings() throws -> [Meeting] {
-        let sql = "SELECT id, started_at, ended_at, audio_file_path, transcript_text, retain_until, audio_deleted_at FROM meetings ORDER BY started_at DESC;"
+        let sql = "SELECT \(Self.selectColumns) FROM meetings ORDER BY started_at DESC;"
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -187,7 +205,7 @@ final class MeetingStore {
     @discardableResult
     func deleteExpiredAudio(now: Date = Date()) throws -> [Meeting] {
         let sql = """
-        SELECT id, started_at, ended_at, audio_file_path, transcript_text, retain_until, audio_deleted_at
+        SELECT \(Self.selectColumns)
         FROM meetings
         WHERE retain_until IS NOT NULL AND retain_until <= ? AND audio_deleted_at IS NULL;
         """
@@ -215,6 +233,8 @@ final class MeetingStore {
         return pruned
     }
 
+    private static let selectColumns = "id, started_at, ended_at, audio_file_path, transcript_text, retain_until, audio_deleted_at, summary_text"
+
     private func meetingFromRow(_ statement: OpaquePointer?) -> Meeting? {
         guard let idCString = sqlite3_column_text(statement, 0),
               let id = UUID(uuidString: String(cString: idCString)),
@@ -226,6 +246,7 @@ final class MeetingStore {
         let transcript = sqlite3_column_text(statement, 4).map { String(cString: $0) }
         let retainUntil = sqlite3_column_type(statement, 5) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 5))
         let audioDeletedAt = sqlite3_column_type(statement, 6) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 6))
+        let summary = sqlite3_column_text(statement, 7).map { String(cString: $0) }
 
         return Meeting(
             id: id,
@@ -234,7 +255,8 @@ final class MeetingStore {
             audioFilePath: String(cString: audioPathCString),
             transcriptText: transcript,
             retainUntil: retainUntil,
-            audioDeletedAt: audioDeletedAt
+            audioDeletedAt: audioDeletedAt,
+            summaryText: summary
         )
     }
 }

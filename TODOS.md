@@ -8,6 +8,13 @@
 
 Captured during `/plan-eng-review` on 2026-08-09, deferred from Phase 1 (audio capture + Whisper.cpp transcription + local storage).
 
+## Resolved: Ollama cloud-inference lockout
+
+**What:** Ollama (used for local summarization, see "Reasoning/summarization" architecture decision) ships an optional cloud-inference feature that can route some model calls to ollama.com instead of running them on-device — directly at odds with this project's "must run and store 100% locally" premise.
+**Why this is recorded here:** Discovered while wiring the Phase 2 Ollama integration (2026-08-10) — not something the original design doc anticipated, since this Ollama feature postdates it. A plain `ollama serve` launched by double-clicking Ollama.app does not have cloud disabled by default.
+**Resolution:** `OllamaServerManager` (Sources/MeetingNoteTaker/Summarization/OllamaServerManager.swift) launches its own `ollama serve` process with `OLLAMA_NO_CLOUD=true` forced in the environment, rather than relying on a separately-launched Ollama.app. If a server is already running on port 11434 when the app starts, `ensureRunning()` returns `.reusedExisting` rather than silently trusting it — there's no API to verify a pre-existing server's cloud setting, so the app warns the user instead of assuming it's safe (same "warn, don't silently assume" posture used for the FileVault check).
+**Depends on / blocked by:** None — implemented as part of the Phase 2 Ollama integration.
+
 ## Speaker diarization
 
 **What:** Label who said what in transcripts.

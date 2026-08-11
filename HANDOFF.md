@@ -1,24 +1,25 @@
 ---
 status: in-progress
 branch: main
-timestamp: 2026-08-10T19:58:00Z
+timestamp: 2026-08-10T21:00:00Z
 files_modified: []
 ---
 
-## Working on: meetingnotetaker — Phase 1 hardened, Phase 2 (Ollama/MCP/Calendar/Gmail) next
+## Working on: meetingnotetaker — Phase 1 hardened, Phase 2 in progress (Ollama summarization built; MCP/Calendar/Gmail/UI not started)
 
 ### Summary
 
 meetingnotetaker is a local-first macOS replica of Granola: record meetings (mic +
 system audio), transcribe locally via whisper.cpp, store everything on-disk, no cloud
 except a narrow bounded exception for user-initiated Google Calendar/Gmail writes.
-**Phase 1 is fully built, hardened, tested, and committed.** It was verified
-end-to-end against a real recording (not just the test sample) before hardening
-started, and the hardening pass below has been implemented and all 22 tests pass.
-Phase 2 (Ollama summarization/action items, MCP server, Calendar/Gmail write-back, and
-the real UI replacing the current `readLine()` CLI) has not started — this doc exists
-so a fresh Claude Code session (this machine or another) can pick that up with full
-context.
+**Phase 1 is fully built, hardened, tested, and committed** — verified end-to-end
+against a real recording, then hardened (FileVault boundary, audio retention,
+error-surfacing fixes) through a full `/plan-eng-review` with all 22 tests passing.
+**Phase 2 has started:** Ollama is installed and wired for local summarization (33
+tests passing total), with a real finding along the way — Ollama has an optional
+cloud-inference feature that had to be explicitly locked out to keep the "100% local"
+guarantee. MCP server, Google Calendar/Gmail write-back, and the real UI (replacing
+the current `readLine()` CLI) have not started.
 
 ### Repo / environment this assumes
 
@@ -81,12 +82,29 @@ context.
    swift build
    swift test
    ```
-   All 22 tests pass as of this save. `WhisperTranscriberTests.testTranscribesKnownSampleAudio`
-   `XCTSkip`s cleanly if the model/sample audio aren't present yet.
+   All 33 tests pass as of this save. `WhisperTranscriberTests.testTranscribesKnownSampleAudio`
+   `XCTSkip`s cleanly if the model/sample audio aren't present yet. Ollama tests
+   (`OllamaClientTests`, `OllamaServerManagerTests`) use stubbed/pure seams, not a
+   live server, so they pass even before Ollama is installed.
 8. **Grant macOS permissions** (GUI-only, cannot be scripted): Microphone (prompted
    automatically) and **Screen & System Audio Recording** (TCC-gated purely through
    System Settings — app opens the right pane, but you click Allow, then relaunch;
    macOS requires a relaunch after granting this specific permission).
+9. **Install Ollama for Phase 2 summarization.** `brew install ollama` failed on the
+   original dev machine two independent ways (Homebrew prefix ownership, and a
+   Homebrew-core crash on macOS 26.4.1 unrelated to ownership) — **download
+   Ollama.app directly from ollama.com/download instead** (drag-to-Applications, no
+   sudo). The app doesn't need to be launched via the GUI — `OllamaServerManager`
+   (see below) launches `ollama serve` itself directly from the `.app` bundle's
+   `Contents/Resources/ollama` binary. Pull the model once manually to prime the
+   local cache (the app doesn't auto-pull yet):
+   ```
+   /Applications/Ollama.app/Contents/Resources/ollama serve &   # or let the app manage this
+   /Applications/Ollama.app/Contents/Resources/ollama pull llama3.1:8b
+   ```
+   `llama3.1:8b` (~4.9GB) is the model currently hardcoded as `OllamaClient`'s default
+   — chosen over the design doc's other candidate (Qwen2.5 7B) as the first pick to
+   prototype with; never formally benchmarked against it.
 
 ### Architecture decisions locked and built (Phase 1 — not up for debate; re-litigating these was explicitly declined during the original eng review)
 
@@ -205,25 +223,64 @@ starts if it isn't already there.
 migration test). 22 tests total, all passing, including the pre-existing real
 end-to-end `WhisperTranscriberTests` case.
 
-### Remaining Work (Phase 2 — none of this has started)
+### Phase 2 progress — Ollama summarization IMPLEMENTED, TESTED (2026-08-10)
 
-0. **BLOCKED on Ollama installation.** `brew install ollama` fails two independent
-   ways on this machine: Homebrew's prefix at `/usr/local/Homebrew` isn't owned by the
-   user account (`sudo chown -R SaiKasam /usr/local/Homebrew` would fix that one, but
-   that's a sudo step for the human, same policy as the Xcode CLT setup earlier), and
-   separately Homebrew's core crashes on macOS 26.4.1 (`macos_version.rb:42` doesn't
-   recognize the version string) — a second, unrelated bug that fixing ownership alone
-   won't resolve. **Recommended path: skip Homebrew entirely, download Ollama.app
-   directly from ollama.com/download** (drag-to-Applications, no sudo, includes the
-   `ollama` CLI). Once installed and running (`ollama serve`, or just launch the app),
-   Phase 2 work can proceed. Check with `curl http://localhost:11434/api/version`.
+Ollama was installed via direct `.app` download (Homebrew stayed broken — see setup
+step 9 above). Before writing any integration code, a real finding surfaced: Ollama
+0.32.7 has an optional cloud-inference feature (`OLLAMA_REMOTES:[ollama.com]`,
+"Ollama cloud disabled: false" by default in the server logs) that routes some model
+calls off-device — directly at odds with this project's local-only premise, and not
+something the original design doc anticipated. Resolved with the user via
+AskUserQuestion before building anything (see TODOS.md "Resolved: Ollama
+cloud-inference lockout" for the full writeup):
+
+- **`OllamaServerManager`** (`Sources/MeetingNoteTaker/Summarization/OllamaServerManager.swift`)
+  — launches `ollama serve` itself with `OLLAMA_NO_CLOUD=true` forced into the
+  environment, rather than trusting a separately-launched Ollama.app instance. Verified
+  live: `Ollama cloud disabled: true` in the server's own log output when launched this
+  way. `ensureRunning()` returns `.launchedManaged` when it started the server itself,
+  or `.reusedExisting` if a server was already listening on 11434 — the latter case
+  can't be verified as cloud-disabled (no API for that), so callers must warn rather
+  than silently trust it. `resolveBinaryPath(_:fileExists:)` and
+  `managedEnvironment(base:)` are pure, tested seams; process-spawning and HTTP
+  reachability polling are integration-level, manually verified rather than unit
+  tested (same tradeoff as `AudioRecorder`'s live-ScreenCaptureKit parts).
+- **`OllamaClient`** (`Sources/MeetingNoteTaker/Summarization/OllamaClient.swift`) —
+  talks to `POST /api/generate` on `127.0.0.1:11434` only. `HTTPRequesting` protocol
+  (structurally satisfied by `URLSession`, same pattern as `AudioFileWriting`) makes
+  `summarize(transcript:)` unit-testable with a stubbed response instead of a live
+  server. `buildSummaryPrompt(transcript:)` is a separately tested pure function.
+- **`MeetingStore`**: added `summaryText: String?` (defaults to `nil` in the struct so
+  existing call sites didn't need touching) and `updateSummary(meetingID:summary:)`.
+  The single-column migration helper from the hardening pass was generalized into
+  `ensureColumnExists(_:type:)` so adding `summary_text` didn't duplicate the
+  `audio_deleted_at` migration pattern — now called for both columns.
+- **Wired into `run()`**: after a transcript is saved, `summarize(meetingID:transcript:store:)`
+  calls `OllamaServerManager.ensureRunning()` then `OllamaClient().summarize(transcript:)`,
+  storing the result via `updateSummary`. **Best-effort, like the missing-Whisper-model
+  path**: if Ollama isn't available or summarization fails for any reason, it prints a
+  message and returns without throwing — the transcript that already saved
+  successfully is never lost over a summarization failure.
+- Manually verified end-to-end against the real running server via `curl` before
+  writing the Swift wrapper (confirmed `llama3.1:8b` produces a sane summary from a
+  sample transcript) — the full `run()` → summarize path itself has NOT been
+  interactively tested yet (needs a real recording, same limitation as Phase 1's
+  interactive testing).
+
+**Tests added:** `OllamaClientTests.swift`, `OllamaServerManagerTests.swift` (both
+new). 33 tests total, all passing.
+
+**Not yet done from the design doc's Ollama step:** benchmarking `llama3.1:8b` against
+Qwen2.5 7B for quality, and action-item extraction (separate from summarization) —
+still gated on the diarization decision below.
+
+### Remaining Work (Phase 2)
+
 1. **Diarization decision is gated** — resolve it (real approach, or explicit
    unattributed fallback) before writing any Ollama action-item extraction code.
-2. Wire Ollama; prototype summarization/action-item extraction prompts against real
-   transcripts. Benchmark model choice (design doc suggested Llama 3.1 8B or Qwen2.5 as
-   starting candidates, never benchmarked). Summarization does NOT need the diarization
-   decision — only action-item extraction (owner attribution) does — so summarization
-   work can start as soon as Ollama itself is installed.
+   Summarization (done, see above) didn't need this; action-item extraction does.
+2. Benchmark `llama3.1:8b` vs Qwen2.5 7B on real transcripts — never done, design doc
+   flagged as needed.
 3. Build the MCP server — Unix domain socket auth (locked direction, see above), tool
    surface: `search_meetings`, `get_transcript`, `get_summary`, `get_action_items`
    (names proposed in the original design doc, not yet reconfirmed).
@@ -237,6 +294,9 @@ end-to-end `WhisperTranscriberTests` case.
    retention policy is now silently deleting audio with no way to review it first,
    which is a real limitation the outside voice flagged and the user knowingly accepted
    for this pass only.
+8. Interactively test the full record → transcribe → summarize flow end-to-end against
+   a real meeting — only the summarization HTTP call has been verified live so far
+   (via curl), not the wired `run()` path.
 
 ### Notes
 

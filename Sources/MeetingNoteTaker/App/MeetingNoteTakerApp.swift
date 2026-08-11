@@ -150,6 +150,45 @@ struct MeetingNoteTakerApp {
 
         try store.updateTranscript(meetingID: meeting.id, transcript: transcript)
         print("Saved to local store: \(StorageLocation.databaseURL.path)")
+
+        await summarize(meetingID: meeting.id, transcript: transcript, store: store)
+    }
+
+    /// Best-effort, like transcription's missing-model handling above:
+    /// summarization failing (Ollama not installed, server won't start,
+    /// model not pulled) should not lose the transcript that already saved
+    /// successfully. Runs entirely against 127.0.0.1 — see OllamaClient.
+    private static func summarize(meetingID: UUID, transcript: String, store: MeetingStore) async {
+        let serverManager = OllamaServerManager()
+        let status: OllamaServerStatus
+        do {
+            status = try await serverManager.ensureRunning()
+        } catch {
+            print("Ollama isn't available (\(error)) — skipping summarization. Transcript is saved; run it later once Ollama is set up.")
+            return
+        }
+
+        if status == .reusedExisting {
+            print("""
+
+            ────────────────────────────────────────────────────────────
+            Warning: using an already-running Ollama server. This app
+            could not verify cloud inference is disabled on it (only a
+            server this app launches itself can guarantee that). Quit
+            Ollama.app and let this app manage it for a guaranteed
+            local-only summary.
+            ────────────────────────────────────────────────────────────
+            """)
+        }
+
+        print("Summarizing (locally via Ollama, no network calls beyond 127.0.0.1)...")
+        do {
+            let summary = try await OllamaClient().summarize(transcript: transcript)
+            try store.updateSummary(meetingID: meetingID, summary: summary)
+            print("\nSummary:\n\(summary)")
+        } catch {
+            print("Summarization failed (\(error)) — transcript is still saved.")
+        }
     }
 
     /// Reminder per TODOS.md: consent notification automation is deferred,
