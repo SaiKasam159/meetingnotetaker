@@ -15,15 +15,25 @@ Captured during `/plan-eng-review` on 2026-08-09, deferred from Phase 1 (audio c
 **Resolution:** `OllamaServerManager` (Sources/MeetingNoteTaker/Summarization/OllamaServerManager.swift) launches its own `ollama serve` process with `OLLAMA_NO_CLOUD=true` forced in the environment, rather than relying on a separately-launched Ollama.app. If a server is already running on port 11434 when the app starts, `ensureRunning()` returns `.reusedExisting` rather than silently trusting it — there's no API to verify a pre-existing server's cloud setting, so the app warns the user instead of assuming it's safe (same "warn, don't silently assume" posture used for the FileVault check).
 **Depends on / blocked by:** None — implemented as part of the Phase 2 Ollama integration.
 
-## Speaker diarization
+## Speaker diarization — RESOLVED 2026-08-11, hard gate cleared
 
 **What:** Label who said what in transcripts.
-**Why:** Action items need an owner to be useful once written to Google Calendar/Gmail, but attribution isn't designed yet.
-**Pros:** Makes extracted action items actually actionable rather than anonymous text.
-**Cons:** Real complexity (diarization models, per-speaker audio separation). Not needed for Phase 1, which only captures and transcribes.
-**Context:** Surfaced during the adversarial design-doc review and confirmed during eng review. During the Phase 1 hardening pass (2026-08-10), whisper.cpp's experimental "tinydiarize" model variant (`-tdrz`, already part of the vendored submodule, no new dependency) was evaluated as a pragmatic v1 option and explicitly rejected: it only detects speaker-turn changes ("someone new started talking"), not verified speaker identity, so labels can drift/misattribute once a 3rd+ speaker re-enters a conversation. Research into a proper speaker-identity approach (e.g. a local pyannote-based sidecar process) continues separately.
-**Hard gate:** Must be decided — proper diarization, or an explicit "ship Phase 2 with unattributed action items" fallback — before the first line of Ollama action-item extraction code is written. Milestone-gated rather than date-gated, chosen deliberately after an outside-voice review flagged that "keep researching" with no concrete trigger risks leaving this permanently unresolved.
-**Depends on / blocked by:** Phase 1 shipping first (done). Blocks the start of Phase 2's Ollama extraction implementation.
+**Why:** Action items need an owner to be useful once written to Google Calendar/Gmail.
+**Decision (locked 2026-08-11):** Real N-speaker diarization, implemented by vendoring **sherpa-onnx** (github.com/k2-fsa/sherpa-onnx, Apache 2.0) and running the pyannote segmentation 3.0 model plus a WeSpeaker English embedding extractor entirely on-device via ONNX Runtime. This clears the hard gate below — Ollama action-item extraction is unblocked, and `get_action_items` can be exposed from the MCP server once extraction exists.
+
+**Why sherpa-onnx and not the Swift-native options:** The Swift-native CoreML diarization SDKs surveyed on 2026-08-11 — FluidAudio (Apache 2.0, pyannote Community-1 via ANE), SpeakerKit (pyannote v4 on Core ML), and speech-swift (MLX) — are all **Apple Silicon only**. FluidAudio and SpeakerKit offload inference to the Apple Neural Engine, and MLX requires Apple Silicon's unified memory architecture by design. This dev machine is an Intel Mac (Radeon Pro 5300M — the same machine whose discrete GPU forced `use_gpu = false` for Whisper, see "Re-test Metal GPU acceleration on Apple Silicon"). sherpa-onnx runs on ONNX Runtime with explicit x86_64 support, so it is the only surveyed option that produces real speaker identity on the machine the project is actually being built on. It also fits the pattern already proven here: a vendored C/C++ library with its own CMake build, linked into SwiftPM through a header-only shim target, exactly like `Vendor/whisper.cpp` and `Sources/CWhisper`.
+
+**Why not the cheaper alternatives that were considered and rejected:**
+- whisper.cpp `tinydiarize` (`-tdrz`) — rejected during the Phase 1 hardening pass (2026-08-10) and still rejected. It detects speaker-turn changes, not verified identity, so labels drift once a third speaker re-enters a conversation.
+- Mic/system-audio channel split — `AudioRecorder` already registers `.microphone` and `.audio` as two separate `SCStream` outputs and merges them into one file in our own code, so splitting them would yield verified two-way attribution ("you" vs "everyone else") with zero new dependencies. Rejected as the *decision* because it collapses all remote participants into one bucket, which is only complete diarization for 1:1 calls. Worth revisiting as a complement rather than a substitute: the mic channel gives *verified* identity for the local user, which sherpa-onnx can only infer, and that is the one identity that matters most for Calendar/Gmail write-back.
+- pyannote as a Python sidecar — works on Intel, but drags a Python runtime into a shipped Swift app.
+- Deferring until an Apple Silicon Mac is available — rejected; that is exactly the open-ended deferral the hard gate was written to prevent.
+
+**Pros:** Real per-speaker identity, fully offline, permissively licensed, works on the current Intel dev machine and on Apple Silicon.
+**Cons:** A second vendored C++ dependency with its own CMake build and linker flags; two more model files to download and eventually ship; clustering needs tuning (see below); the segmentation plus embedding pipeline costs meaningful extra CPU time on top of transcription, on a machine with no usable GPU acceleration. Benchmark the added wall-clock cost on a real meeting recording before wiring diarization into the default `run()` path.
+
+**Hard gate (now cleared):** Required a decision — proper diarization, or an explicit "ship Phase 2 with unattributed action items" fallback — before the first line of Ollama action-item extraction code. Milestone-gated rather than date-gated, chosen deliberately after an outside-voice review flagged that "keep researching" with no concrete trigger risks leaving this permanently unresolved.
+**Depends on / blocked by:** Nothing blocking the decision. Implementation is blocked on returning to a Mac — see HANDOFF.md "Speaker diarization via sherpa-onnx" for the verified integration recipe (model URLs, C API shape, config fields, build steps).
 
 ## Data retention / deletion policy
 
@@ -73,3 +83,20 @@ Captured during `/plan-eng-review` on 2026-08-09, deferred from Phase 1 (audio c
 **Cons:** Does not protect against another logged-in user on the same machine, or malware running while logged in. Revisit if the threat model changes (shared-machine use, multi-user).
 **Context:** Raised during eng review; resolved during the Phase 1 hardening pass after checking that FileVault (AES-XTS, hardware-backed) already covers the realistic threat model for solo use.
 **Depends on / blocked by:** None — implemented as part of the Phase 1 hardening pass.
+
+## Bug: concurrent writes to a single AVAudioFile from two capture queues
+
+**What:** `AudioRecorder.startRecording()` registers two stream outputs on two independent dispatch queues — `.audio` on `"audio.capture.queue"` and `.microphone` on `"mic.capture.queue"` (AudioRecorder.swift:83-84). Both queues' callbacks land in the same `didOutputSampleBuffer` handler, which calls `write(_:)` and then `writePCMBuffer(_:)` on the same `AVAudioFile` instance (AudioRecorder.swift:140-147). `AVAudioFile` is not documented as thread-safe, and nothing here serializes the two queues.
+**Why:** This is a data race on every recording that has both system audio and microphone input, which is every real meeting. Consequences range from interleaved/corrupted frames to a crash mid-recording. It has not visibly bitten yet — Phase 1's end-to-end verification produced a usable transcript — which makes it the kind of latent race that surfaces under load (longer meetings, busier machine) rather than in a short test.
+**Secondary issue in the same path:** the two streams are being *interleaved* into one file rather than mixed. Each callback appends whatever buffer it happened to receive, so system audio and mic audio alternate in the output file instead of being summed into a single mixed signal.
+**Fix direction:** Serialize writes onto one dedicated queue, and decide explicitly whether the two sources should be mixed into one signal or written to two files. Writing them to two files is the better option — it fixes the race structurally (one writer per file) and preserves the mic channel as verified local-speaker identity, which complements sherpa-onnx diarization (see "Speaker diarization"). Note that two files reintroduces the cross-source alignment concern the single-`SCStream` design was chosen to avoid — but only at the file level, not the clock level: both streams still come from the same synchronized ScreenCaptureKit pipeline, so their timestamps remain comparable.
+**Context:** Found on 2026-08-11 while surveying diarization options, by reading `AudioRecorder` to check whether mic and system audio were separable at the source. They are.
+**Depends on / blocked by:** Needs a Mac to build and verify — cannot be tested on the Windows machine this was found on.
+
+## Bug: AudioSampleLoader's stereo capture only ever fills the left channel
+
+**What:** `AudioRecorder`'s capture config sets `channelCount = 2` (AudioRecorder.swift:73) and the output `AVAudioFormat` is created with `channels: 2` (AudioRecorder.swift:78), but the `CMSampleBuffer.asPCMBuffer(format:)` helper copies into `channelData[0]` only (AudioRecorder.swift:190-194). The right channel of every written buffer is left at whatever `AVAudioPCMBuffer` allocated it as.
+**Why:** Recordings are nominally stereo but carry real audio in one channel and uninitialized data in the other. Transcription happens to be unaffected because `AudioSampleLoader.loadMonoFloat32Samples` downmixes to mono at 16 kHz before Whisper sees it — which is also why this went unnoticed. It will matter for anything that consumes the raw `.caf` directly: playback, re-transcription with different tooling, or feeding audio to diarization.
+**Fix direction:** Either copy both channels properly, or capture mono deliberately (`channelCount = 1`) and stop claiming stereo. Mono is likely the honest choice — nothing in the product needs a stereo meeting recording, and it halves the audio file size, which interacts well with the 7-day retention policy.
+**Context:** Found on 2026-08-11 alongside the concurrent-write race above.
+**Depends on / blocked by:** Needs a Mac to build and verify.

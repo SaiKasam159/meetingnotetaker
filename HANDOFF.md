@@ -1,27 +1,40 @@
 ---
 status: in-progress
 branch: main
-timestamp: 2026-08-11T13:15:00Z
-files_modified: []
+timestamp: 2026-08-11T18:40:00Z
+files_modified: [TODOS.md, HANDOFF.md]
 ---
 
 ## Working on: meetingnotetaker — Phase 1 hardened, Phase 2 in progress (Ollama summarization + MCP server built; Calendar/Gmail/UI not started)
 
-### PAUSED HERE (2026-08-11) — read this first
+### RESUMED 2026-08-11 on a Windows machine — read this first
 
-Session stopped by explicit user request at a clean point: working tree is clean, the
-MCP server commit (`c9427f0`) is pushed to `origin/main`, all 59 tests pass. Nothing is
-half-finished or mid-edit. Before stopping, three options for what's next were
-presented and the user chose to pause instead of picking one — so **the next session
-should ask what to prioritize, not assume**:
-1. Benchmark `llama3.1:8b` vs Qwen2.5 7B on real transcripts (doable solo, no user
-   action needed).
-2. User connects the MCP config to a real Claude client and confirms it works from an
-   actual conversation, plus runs the full interactive record→transcribe→summarize
-   test (both need the user, not more code).
-3. User sets up a Google Cloud project + OAuth consent screen so Calendar/Gmail work
-   can start (needs the user).
-See "Remaining Work" below for the complete list this pause point applies to.
+The project was migrated from the Intel MacBook to a Windows 10 machine mid-Phase-2.
+**Nothing in this codebase builds or runs on Windows** and no attempt was made to change
+that — the decision was explicitly to keep it macOS-only and return to the Mac. The
+blockers, for the record: `Package.swift` declares `.macOS(.v15)`; `AudioRecorder`,
+`PermissionManager`, and `AudioSampleLoader` depend on ScreenCaptureKit and
+AVFoundation; the linker pulls in Metal/MetalKit/Accelerate; `MeetingStore` uses
+`import SQLite3`; `StorageLocation` uses macOS-specific paths and xattrs. No Swift
+toolchain or cmake is installed there either.
+
+One migration hazard to know about if any session ever runs on that Windows checkout:
+its `core.symlinks` is `false`, so the 22 header symlinks in `Sources/CWhisper/include/`
+appear as ordinary text files containing their link targets. The git *index* still holds
+them correctly as mode `120000`, so this is harmless as long as nobody stages that
+directory. **Never `git add Sources/CWhisper/include/` from Windows** — it would rewrite
+mode `120000` to `100644` and break the Mac build.
+
+What the Windows session accomplished, since it could not compile: it resolved the
+**speaker diarization hard gate** that was blocking all Ollama action-item extraction
+work, and filed two real bugs found by reading `AudioRecorder`. See "Speaker diarization
+via sherpa-onnx" below for the full verified integration recipe, and `TODOS.md` for the
+decision record and the two bugs.
+
+The previous pause point (2026-08-11, after commit `c9427f0`) had listed three options
+without choosing one. Option 1 of that list — the diarization gate — is now decided. The
+remaining two (connect a real Claude client to the MCP server; set up Google Cloud OAuth)
+are still open and both need a Mac or the user. See "Remaining Work" below.
 
 ### Summary
 
@@ -387,12 +400,120 @@ has pointed an actual Claude client at it.
 temp-store helper that both `MeetingStoreTests` and `MCPServerTests` now share (was
 duplicated `private` inside `MeetingStoreTests` before). 59 tests total, all passing.
 
+### Speaker diarization via sherpa-onnx — DECIDED 2026-08-11, NOT YET IMPLEMENTED
+
+The hard gate from `TODOS.md` is cleared. The decision is **real N-speaker diarization
+using sherpa-onnx**, not the tinydiarize turn-detection approach (rejected during the
+hardening pass) and not the "ship unattributed" fallback. `TODOS.md` under "Speaker
+diarization" holds the decision record and the full rejected-alternatives list; the
+short version of *why sherpa-onnx specifically* is that every Swift-native CoreML
+diarization SDK surveyed (FluidAudio, SpeakerKit, speech-swift/MLX) is Apple Silicon
+only, and this project's dev machine is an Intel Mac. sherpa-onnx runs on ONNX Runtime
+with explicit x86_64 support.
+
+Everything below was verified against real sources on 2026-08-11, not guessed — same
+practice used for the MCP Swift SDK. What was *not* verifiable without a Mac is marked
+explicitly.
+
+**Models — URLs and sizes confirmed via the GitHub releases API:**
+- Segmentation: `sherpa-onnx-pyannote-segmentation-3-0.tar.bz2`, 6,958,444 bytes —
+  `https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2`
+  (unpacks to a directory containing `model.onnx` and an int8 variant).
+- Embedding extractor, English: `wespeaker_en_voxceleb_CAM++.onnx`, 29,292,684 bytes —
+  `https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_CAM%2B%2B.onnx`
+  Note the release tag is misspelled **`speaker-recongition-models`** upstream; that is
+  the correct URL, not a typo in this document. Alternatives in the same release if
+  CAM++ underperforms: `wespeaker_en_voxceleb_resnet34_LM.onnx` (26.5 MB),
+  `nemo_en_titanet_small.onnx` (40.3 MB), `3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`
+  (29.6 MB). Pick an English model deliberately — sherpa-onnx's own C example ships a
+  Chinese (`zh-cn`) extractor, which would be the wrong default here.
+- Both models are 16 kHz. Gitignore them alongside the existing
+  `Vendor/whisper.cpp/models/*.bin` rule.
+
+**C API — shape confirmed from `c-api-examples/offline-speaker-diarization-c-api.c`
+in the upstream repo:**
+```c
+SherpaOnnxOfflineSpeakerDiarizationConfig config;
+memset(&config, 0, sizeof(config));
+config.segmentation.pyannote.model = segmentation_model_path;
+config.embedding.model            = embedding_model_path;
+config.clustering.num_clusters    = 4;   // see note below
+
+const SherpaOnnxOfflineSpeakerDiarization *sd =
+    SherpaOnnxCreateOfflineSpeakerDiarization(&config);
+
+// Must match the model's rate (16 kHz) or results are garbage:
+SherpaOnnxOfflineSpeakerDiarizationGetSampleRate(sd);
+
+const SherpaOnnxOfflineSpeakerDiarizationResult *result =
+    SherpaOnnxOfflineSpeakerDiarizationProcessWithCallback(
+        sd, samples, num_samples, ProgressCallback, NULL);
+
+int32_t n = SherpaOnnxOfflineSpeakerDiarizationResultGetNumSegments(result);
+const SherpaOnnxOfflineSpeakerDiarizationSegment *segments =
+    SherpaOnnxOfflineSpeakerDiarizationResultSortByStartTime(result);
+// segments[i].start, segments[i].end (seconds), segments[i].speaker (int)
+
+SherpaOnnxOfflineSpeakerDiarizationDestroySegment(segments);
+SherpaOnnxOfflineSpeakerDiarizationDestroyResult(result);
+SherpaOnnxDestroyOfflineSpeakerDiarization(sd);
+```
+
+**Clustering with an unknown speaker count.** The upstream C example hardcodes
+`num_clusters = 4` because it processes a fixed four-speaker test file. Meetings do not
+know their speaker count in advance. Set `num_clusters = -1`, which makes the pipeline
+fall back to threshold-based clustering — a smaller threshold yields more speakers, a
+larger one fewer; upstream suggests starting around `0.5` and tuning. **Caveat: the
+`-1` sentinel and the threshold field's behaviour were confirmed from sherpa-onnx's Go
+bindings and CLI docs (`--clustering.cluster-threshold`), not from the C header
+directly — confirm the exact C struct field name against
+`sherpa-onnx/c-api/c-api.h` on the Mac before writing the Swift call.** The threshold
+is a real tuning parameter, not a set-and-forget constant; budget time for it against a
+real multi-person recording.
+
+**Audio input is already handled.** sherpa-onnx wants 16 kHz mono Float32 samples, which
+is exactly what `AudioSampleLoader.loadMonoFloat32Samples(from:)` already produces for
+Whisper. Reuse it as-is; the only cleanup worth doing is renaming
+`AudioSampleLoader.whisperSampleRate` to something transcriber-neutral now that two
+consumers depend on it.
+
+**Build and SwiftPM wiring — mirror the existing whisper.cpp setup exactly.** Vendor
+sherpa-onnx as a second git submodule under `Vendor/`, build it with its own CMake
+invocation (static libs, `CMAKE_OSX_DEPLOYMENT_TARGET=15.0` to match), add a
+`CSherpaOnnx` header-only shim target alongside `Sources/CWhisper` following the same
+symlink-the-headers-into-`include/` pattern (`cSettings.headerSearchPath` does not work
+for module-map header resolution in this SPM setup — do not re-try it), and extend
+`Package.swift`'s `unsafeFlags` with the resulting `-L` paths and `-l` names. **Verify
+the actual library output paths against a real `cmake --build` run before writing the
+linker flags** — that is precisely how the existing whisper.cpp flags were derived, and
+ggml's libs turned out not to live where the obvious guess would put them.
+
+**Cost to measure before wiring this into the default `run()` path.** Segmentation plus
+embedding extraction on top of Whisper transcription, on an Intel Mac with no usable GPU
+acceleration (Metal is force-disabled — see the Metal TODO), could be slow enough to
+change the UX. Time it against a real meeting recording and decide whether diarization
+is default-on, opt-in, or deferred to a background pass.
+
+**Sequencing note.** The "concurrent writes to a single AVAudioFile" bug filed in
+`TODOS.md` overlaps this work. Its recommended fix — writing the `.microphone` and
+`.audio` streams to two separate files instead of interleaving them into one — also
+yields *verified* identity for the local speaker, which diarization can only infer.
+Doing that fix first means sherpa-onnx's inferred speaker labels can be anchored to a
+known "this one is you" rather than left as anonymous `speaker_00`/`speaker_01`.
+
 ### Remaining Work (Phase 2)
 
-1. **Diarization decision is gated** — resolve it (real approach, or explicit
-   unattributed fallback) before writing any Ollama action-item extraction code.
-   Summarization (done above) didn't need this; action-item extraction does, and so
-   does exposing `get_action_items` from the MCP server.
+1. ~~Diarization decision is gated~~ — **DECIDED 2026-08-11: sherpa-onnx, real
+   N-speaker diarization.** Action-item extraction and `get_action_items` on the MCP
+   server are unblocked as of that decision. The *implementation* is not done: see
+   "Speaker diarization via sherpa-onnx" above for the verified recipe. Action-item
+   extraction can now be written in parallel with, or ahead of, that implementation —
+   it no longer has to wait.
+1a. Fix the two `AudioRecorder` bugs filed in `TODOS.md` on 2026-08-11: concurrent
+   writes to one `AVAudioFile` from two capture queues (a real data race on every
+   meeting recording), and the stereo capture that only ever fills the left channel.
+   Both need a Mac to build and verify. Worth doing before the diarization
+   implementation — see the sequencing note above.
 2. Benchmark `llama3.1:8b` vs Qwen2.5 7B on real transcripts — never done, design doc
    flagged as needed.
 3. Actually configure a Claude client (Desktop or Code) to launch the MCP server (see
